@@ -9,7 +9,6 @@ export default {
         env.OIL_KV.get("gold_data", "json"),
       ]);
 
-      // 缓存没有就当场抓一次（不耗额外额度，因为 /update 也会触发）
       const o = oilCached || await fetchAndSave(env, false);
       const g = goldCached || await fetchGoldAndSave(env);
 
@@ -25,9 +24,10 @@ export default {
       const goldUTC = g?.updatedAt || '';
       const displayUTC = oilUTC || goldUTC;
 
-      const tag = o?.isSettlement
-        ? "✅ 每日凌晨 04:00 自动更新（结算价）"
-        : "⚡ 实时最新价（盘中）";
+      // 原油标签：区分自动(凌晨) 与 手动刷新
+      const oilTag = o?.isSettlement
+        ? "✅ 每日参考价（凌晨 04:00 自动抓取，结算参考）"
+        : "⚡ 最新参考价（手动刷新，盘中最新）";
 
       const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -35,14 +35,14 @@ export default {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>国际原油 & 黄金每日参考价</title>
-<meta name="description" content="布伦特原油 $${pricePerBarrel || '—'} USD/桶，国际黄金 $${g?.priceUsdPerOz || '—'} USD/盎司，每日凌晨自动更新">
+<meta name="description" content="布伦特原油 $${pricePerBarrel || '—'} USD/桶，国际黄金 $${g?.priceUsdPerOz || '—'} USD/盎司，每日参考价">
 </head>
 <body style="font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 20px">
 <h1>📊 国际原油 & 黄金 · 每日参考价</h1>
-<p><strong>${tag}</strong></p>
 
 ${o ? `
 <h2 style="margin-top:32px">🛢️ 布伦特原油</h2>
+<p><strong>${oilTag}</strong></p>
 <table style="width:100%;border-collapse:collapse;margin:20px 0">
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">每桶价格</td><td style="padding:8px 0">$${pricePerBarrel} USD</td></tr>
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">每升价格</td><td style="padding:8px 0">$${pricePerLiter} USD（≈ ¥${pricePerLiterCny} 元/升）</td></tr>
@@ -51,14 +51,16 @@ ${o ? `
 
 ${g ? `
 <h2 style="margin-top:32px">🪙 国际黄金（XAU/USD）</h2>
+<p><strong>📅 每日参考价（延迟日更，非盘中实时）</strong></p>
 <table style="width:100%;border-collapse:collapse;margin:20px 0">
-<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">每盎司价格</td><td style="padding:8px 0">$${g.priceUsdPerOz} USD/盎司（≈ ¥${g.priceCnyPerGram}/克）</td></tr>
-<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">数据源</td><td style="padding:8px 0">LSEG 路孚特（MetalpriceAPI 免费档）</td></tr>
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">每盎司价格</td><td style="padding:8px 0">$${g.priceUsdPerOz} USD/盎司</td></tr>
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">每克价格</td><td style="padding:8px 0">≈ ¥${g.priceCnyPerGram} / 克</td></tr>
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">数据源</td><td style="padding:8px 0">MetalpriceAPI 免费档（延迟约24h）</td></tr>
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">数据更新地时间</td><td style="padding:8px 0">${goldUTC} <span style="font-size:12px;color:#999">(UTC)</span></td></tr>
 </table>` : ''}
 
 <p style="font-size:14px;color:#666">🕐 你的本地时间：<span id="localTime"></span> <span style="font-size:12px;color:#999" id="tz"></span></p>
-<p style="font-size:12px;color:#aaa">以上为国际原料参考价，非零售汽油价 / 首饰金价。数据每日凌晨自动更新。</p>
+<p style="font-size:12px;color:#aaa">以上为国际原料参考价，非零售汽油价 / 首饰金价。黄金为延迟日更参考价，不代表实时盘中报价。</p>
 <p style="font-size:12px;color:#aaa"><a href="https://metalpriceapi.com" target="_blank" rel="noopener">Data provided by MetalpriceAPI</a> · <a href="/update">手动刷新</a> · <a href="/data">原始JSON</a></p>
 
 <script>
@@ -94,7 +96,7 @@ ${g ? `
     return new Response('Not Found', { status: 404 });
   },
 
-  // 凌晨 4 点自动触发（UTC 20:00）
+  // 凌晨 4 点自动触发
   async scheduled(event, env) {
     await Promise.allSettled([fetchAndSave(env, true), fetchGoldAndSave(env)]);
   }
@@ -115,13 +117,13 @@ async function fetchAndSave(env, isScheduled) {
     formatted: p.formatted,
     timestamp: p.created_at || p.timestamp,
     updatedLocal: new Date().toLocaleString("zh-CN", { timeZone: 'Asia/Shanghai' }),
-    isSettlement: isScheduled,
+    isSettlement: isScheduled,   // 凌晨跑=true，手动=false
   };
   await env.OIL_KV.put("oil_data", JSON.stringify(result), { expirationTtl: 86400 * 2 });
   return result;
 }
 
-// ---------- 黄金（MetalpriceAPI 免费档）----------
+// ---------- 黄金（MetalpriceAPI 免费档，延迟日更）----------
 async function fetchGoldAndSave(env) {
   const apiKey = env.METALPRICEAPI_KEY;
   if (!apiKey) throw new Error("Missing METALPRICEAPI_KEY");
@@ -133,11 +135,8 @@ async function fetchGoldAndSave(env) {
   if (!res.ok) throw new Error(`Gold API ${res.status}`);
   const j = await res.json();
 
-  // API 返回 rates.XAU = USD 兑 XAU 的汇率（即 1美元能买多少盎司）
-  // 所以 1 盎司美元价 = 1 / rates.XAU
-  const usdPerOz = 1 / j.rates.XAU;
-  // 1 金衡盎司 = 31.1034768 克，再乘 CNY 汇率得人民币克价
-  const cnyPerGram = +(usdPerOz / 31.1034768 * j.rates.CNY).toFixed(2);
+  const usdPerOz = 1 / j.rates.XAU;                    // 1盎司美元价
+  const cnyPerGram = +(usdPerOz / 31.1034768 * j.rates.CNY).toFixed(2); // 人民币/克
 
   const gold = {
     priceUsdPerOz: +usdPerOz.toFixed(2),
