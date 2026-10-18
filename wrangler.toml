@@ -1,15 +1,12 @@
-name = "oil-data-worker"
-
+name = "oil-price-worker"
 main = "src/index.js"
+compatibility_date = "2024-01-01"
 
-compatibility_date = "2023-10-01"
-
+# 绑定 KV（已填入你的真实 KV ID）
 [[kv_namespaces]]
-
 binding = "OIL_KV"
-
 id = "af76a1d05d444244a468ed02d6617f98"
 
+# 凌晨 4 点抓取（UTC 20:00 = 北京 04:00）
 [triggers]
-
-crons = ["0 0 * * *"]
+crons = ["0 20 * * *"]
