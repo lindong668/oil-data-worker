@@ -5,7 +5,6 @@ export default {
     // 首页：HTML 展示（含桶转升 + 结算/实时标注）
     if (url.pathname === '/') {
       const cached = await env.OIL_KV.get("oil_data", "json");
-      // 有缓存读缓存；无缓存则实时抓（耗API额度）
       const data = cached || await fetchAndSave(env, false);
       
       let html = '<h1>加载中...</h1>';
@@ -13,9 +12,11 @@ export default {
         const pricePerBarrel = parseFloat(data.price);
         const pricePerLiter = (pricePerBarrel / 158.987).toFixed(4);
         const pricePerLiterCny = (pricePerLiter * 7.2).toFixed(2);
-        const time = data.timestamp ? new Date(data.timestamp).toLocaleString('zh-CN') : '未知';
+        // ✅ 修复：优先用 created_at，兼容 timestamp
+        const time = data.timestamp 
+          ? new Date(data.timestamp).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }) 
+          : (data.updatedLocal || '未知');
 
-        // 核心文案区分：凌晨抓=昨日收盘价，手动实时抓=盘中价
         const tag = data.isSettlement 
           ? "✅ 昨日 ICE 结算价（每日凌晨 04:00 自动更新）" 
           : "⚡ 实时最新价（盘中，手动刷新触发）";
@@ -52,22 +53,21 @@ export default {
       return new Response(data, { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
     }
 
-    // /update：手动拉取实时价（耗 1 次额度）
+    // /update：手动拉取实时价
     if (url.pathname === '/update') {
-      const result = await fetchAndSave(env, false);
+      await fetchAndSave(env, false);
       return new Response('OK - 实时数据已更新（盘中价）');
     }
 
     return new Response('Not Found', { status: 404 });
   },
 
-  // 凌晨 4 点自动触发：强制抓取，定为昨日结算价
+  // 凌晨 4 点自动触发
   async scheduled(event, env) {
     await fetchAndSave(env, true);
   }
 };
 
-// 统一抓取与存储逻辑
 async function fetchAndSave(env, isScheduled) {
   const apiKey = env.OILPRICEAPI_KEY; 
   if (!apiKey) throw new Error("Missing OILPRICEAPI_KEY in env");
@@ -84,12 +84,12 @@ async function fetchAndSave(env, isScheduled) {
   const result = {
     price: priceData.price,
     formatted: priceData.formatted,
-    timestamp: priceData.timestamp, 
-    updatedLocal: new Date().toLocaleString("zh-CN"),
-    isSettlement: isScheduled, // 凌晨=true(结算价)，手动=false(实时价)
+    // ✅ 修复：用 created_at（API 实际返回的字段），兜底 timestamp
+    timestamp: priceData.created_at || priceData.timestamp,
+    updatedLocal: new Date().toLocaleString("zh-CN", { timeZone: 'Asia/Shanghai' }),
+    isSettlement: isScheduled,
   };
 
-  // 缓存 2 天，确保白天访问不消耗额外 API 额度
   await env.OIL_KV.put("oil_data", JSON.stringify(result), { expirationTtl: 86400 * 2 });
   return result;
 }
