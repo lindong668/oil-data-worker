@@ -1,13 +1,64 @@
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname === "/") {
-      const cached = await env.OIL_KV.get("brent_data", "json");
-      // 有缓存读缓存（凌晨存的昨日结算价）；无缓存则实时抓
+
+    // 首页：HTML 展示（含桶转升 + 结算/实时标注）
+    if (url.pathname === '/') {
+      const cached = await env.OIL_KV.get("oil_data", "json");
+      // 有缓存读缓存；无缓存则实时抓（耗API额度）
       const data = cached || await fetchAndSave(env, false);
-      return new Response(generateHTML(data), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
+      
+      let html = '<h1>加载中...</h1>';
+      if (data) {
+        const pricePerBarrel = parseFloat(data.price);
+        const pricePerLiter = (pricePerBarrel / 158.987).toFixed(4);
+        const pricePerLiterCny = (pricePerLiter * 7.2).toFixed(2);
+        const time = data.timestamp ? new Date(data.timestamp).toLocaleString('zh-CN') : '未知';
+
+        // 核心文案区分：凌晨抓=昨日收盘价，手动实时抓=盘中价
+        const tag = data.isSettlement 
+          ? "✅ 昨日 ICE 结算价（每日凌晨 04:00 自动更新）" 
+          : "⚡ 实时最新价（盘中，手动刷新触发）";
+
+        html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>布伦特原油价格 - ${pricePerBarrel} USD/桶</title>
+<meta name="description" content="布伦特原油每日参考价 ${pricePerBarrel} 美元/桶，约合 ${pricePerLiter} 美元/升（${pricePerLiterCny} 元/升估算）">
+</head>
+<body style="font-family:system-ui,sans-serif;max-width:600px;margin:40px auto;padding:0 20px">
+<h1>🛢️ 布伦特原油 · 每日参考价</h1>
+<h2 style="color:#d35400; font-size: 36px;">$${pricePerBarrel} <span style="font-size:18px">USD/桶</span></h2>
+<p><strong>${tag}</strong></p>
+<table style="width:100%;border-collapse:collapse;margin:20px 0">
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">每升价格</td><td style="padding:8px 0">$${pricePerLiter} USD（≈ ¥${pricePerLiterCny} 元/升）</td></tr>
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">数据时间</td><td style="padding:8px 0">${time}</td></tr>
+</table>
+<p style="font-size:14px;color:#999">以上为国际原油原料价（1桶=158.987升），非零售汽油价格。默认展示昨日收盘价，手动刷新可看实时盘中价。</p>
+<p style="font-size:14px;color:#999"><a href="/update">手动刷新实时价</a> · <a href="/data">查看原始JSON</a></p>
+</body></html>`;
+      } else {
+        html = '<h1>暂无数据</h1><p><a href="/update">点击更新数据</a></p>';
+      }
+      return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
-    return new Response("Not Found", { status: 404 });
+
+    // /data：原始 JSON
+    if (url.pathname === '/data') {
+      const data = await env.OIL_KV.get("oil_data");
+      if (!data) return new Response('暂无数据', { status: 200 });
+      return new Response(data, { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+    }
+
+    // /update：手动拉取实时价（耗 1 次额度）
+    if (url.pathname === '/update') {
+      const result = await fetchAndSave(env, false);
+      return new Response('OK - 实时数据已更新（盘中价）');
+    }
+
+    return new Response('Not Found', { status: 404 });
   },
 
   // 凌晨 4 点自动触发：强制抓取，定为昨日结算价
@@ -16,14 +67,17 @@ export default {
   }
 };
 
+// 统一抓取与存储逻辑
 async function fetchAndSave(env, isScheduled) {
-  // 直接读取你刚在后台设置的加密变量，无需硬编码
   const apiKey = env.OILPRICEAPI_KEY; 
   if (!apiKey) throw new Error("Missing OILPRICEAPI_KEY in env");
   
-  const res = await fetch(`https://api.oilpriceapi.com/v1/prices/latest?by_code=BRENT_CRUDE_USD`, {
-    headers: { "Authorization": `Token ${apiKey}` }
+  const apiUrl = 'https://api.oilpriceapi.com/v1/prices/latest?by_code=BRENT_CRUDE_USD';
+  const res = await fetch(apiUrl, {
+    headers: { 'Authorization': `Token ${apiKey}` }
   });
+  if (!res.ok) throw new Error(`API失败: ${res.status}`);
+  
   const json = await res.json();
   const priceData = json.data;
 
@@ -36,26 +90,6 @@ async function fetchAndSave(env, isScheduled) {
   };
 
   // 缓存 2 天，确保白天访问不消耗额外 API 额度
-  await env.OIL_KV.put("brent_data", JSON.stringify(result), { expirationTtl: 86400 * 2 });
+  await env.OIL_KV.put("oil_data", JSON.stringify(result), { expirationTtl: 86400 * 2 });
   return result;
-}
-
-function generateHTML(data) {
-  const timeStr = data.timestamp ? new Date(data.timestamp).toLocaleString("zh-CN") : "未知";
-  // 核心文案区分：凌晨抓=昨日收盘价，手动实时抓=盘中价
-  const tag = data.isSettlement 
-    ? "✅ 昨日 ICE 结算价（每日凌晨 04:00 更新）" 
-    : "⚡ 实时最新价（盘中，手动刷新触发）";
-  
-  return `
-    <!DOCTYPE html>
-    <html><head><meta charset="utf-8"><title>布伦特原油每日参考价</title></head>
-    <body style="font-family: sans-serif; padding: 40px; text-align: center;">
-      <h1>布伦特原油 · 每日参考价</h1>
-      <h2 style="color:#d35400; font-size: 48px;">${data.formatted || '$--'} <span style="font-size:24px">USD/桶</span></h2>
-      <p><strong>${tag}</strong></p>
-      <p style="color:#666; font-size:14px;">数据时间（UTC）：${timeStr}</p>
-      <p style="color:#999; font-size:12px;">本页默认展示昨日收盘价（ICE结算价），手动刷新可看实时盘中价</p>
-    </body></html>
-  `;
 }
