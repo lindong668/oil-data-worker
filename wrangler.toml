@@ -1,0 +1,15 @@
+name = "oil-data-worker"
+
+main = "src/index.js"
+
+compatibility_date = "2023-10-01"
+
+[[kv_namespaces]]
+
+binding = "OIL_KV"
+
+id = "af76a1d05d444244a468ed02d6617f98"
+
+[triggers]
+
+crons = ["0 0 * * *"]
