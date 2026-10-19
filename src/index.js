@@ -79,6 +79,16 @@ function historySpec(key) {
 /** KV 最多保留的历史条数（约 1 年交易日） */
 const HISTORY_MAX_ROWS = 400;
 
+// ------------------------------------------------------------
+// 每日最少采样次数：低于此值时，该日的最高/最低不展示
+// ------------------------------------------------------------
+// 为什么需要：cron 每小时抓一次，伦敦交易时段 01:00-23:00 理论最多 22 个点。
+// 但首日只有 1 次采样，四个字段（开/高/低/收）必然完全相同 ——
+// 摆成 OHLC 四列看着就像编造的数据。
+// 而且即便攒满一个月，22 个采样点之间的真实日内高低点仍可能漏掉。
+// 所以：样本不足就不展示高/低，只保留有意义的收盘价。宁缺毋滥。
+const SAMPLES_MIN = 3;
+
 /** 北京时间日期串 YYYY-MM-DD（用于「每天一次」的闸门判断） */
 function beijingDateString(d = new Date()) {
   try {
@@ -997,17 +1007,28 @@ ${switchLink}
   const line = pts.map((p, i) => `${i ? 'L' : 'M'}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' ');
   const area = `${line} L${pts[pts.length - 1][0].toFixed(1)},${H - PAD} L${pts[0][0].toFixed(1)},${H - PAD} Z`;
 
+  // 采样次数不足时，最高/最低不具参考性 —— 直接显示 —，不拿单次采样冒充日内极值
+  const thin = show.filter(r => (r.samples || 0) < SAMPLES_MIN).length;
+
   const trs = show.slice().reverse().map(r => {
     const d = toNum(r.diff);
     const c = d == null ? '#999' : (d >= 0 ? upColor : downColor);
     const sign = d == null ? '—' : (d >= 0 ? '+' : '') + d.toFixed(2) + '%';
+    const n = r.samples || 0;
+    const enough = n >= SAMPLES_MIN;
+    // 样本不足 → 高/低留空并标灰，避免「四个值一模一样」看起来像编造的 OHLC
+    const hi = enough ? (r.high ?? '—') : '—';
+    const lo = enough ? (r.low ?? '—')  : '—';
+    const gray = enough ? '' : 'color:#bbb';
+    const op = n >= 2 ? (r.open ?? '—') : '—';   // 只有 1 次采样时开盘也不成立
     return `<tr style="border-bottom:1px solid #eee">
 <td style="padding:6px 4px">${r.day}</td>
-<td style="padding:6px 4px;text-align:right">${r.open ?? '—'}</td>
-<td style="padding:6px 4px;text-align:right">${r.high ?? '—'}</td>
-<td style="padding:6px 4px;text-align:right">${r.low ?? '—'}</td>
+<td style="padding:6px 4px;text-align:right;${n >= 2 ? '' : 'color:#bbb'}">${op}</td>
+<td style="padding:6px 4px;text-align:right;${gray}">${hi}</td>
+<td style="padding:6px 4px;text-align:right;${gray}">${lo}</td>
 <td style="padding:6px 4px;text-align:right"><b>${r.close}</b></td>
-<td style="padding:6px 4px;text-align:right;color:${c}">${sign}</td></tr>`;
+<td style="padding:6px 4px;text-align:right;color:${c}">${sign}</td>
+<td style="padding:6px 4px;text-align:right;color:${enough ? '#888' : '#c0392b'};font-size:12px">${n}${enough ? '' : ' ※'}</td></tr>`;
   }).join('');
 
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
@@ -1021,7 +1042,7 @@ ${switchLink}
 <div style="display:flex;gap:24px;flex-wrap:wrap;margin:16px 0">
 <div><div style="font-size:12px;color:#888">最新收盘</div><div style="font-size:26px;font-weight:600">$${last}</div></div>
 <div><div style="font-size:12px;color:#888">区间涨跌</div><div style="font-size:26px;font-weight:600;color:${trendColor}">${totalChange >= 0 ? '+' : ''}${totalChange.toFixed(2)} (${totalPct >= 0 ? '+' : ''}${totalPct.toFixed(2)}%)</div></div>
-<div><div style="font-size:12px;color:#888">区间最高 / 最低</div><div style="font-size:26px;font-weight:600">${max} / ${min}</div></div>
+<div><div style="font-size:12px;color:#888">区间收盘高 / 低</div><div style="font-size:26px;font-weight:600">${max} / ${min}</div></div>
 </div>
 
 <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;border:1px solid #eee;border-radius:8px;background:#fafafa">
@@ -1038,12 +1059,18 @@ ${switchLink}
 <thead><tr style="border-bottom:2px solid #ddd;text-align:left;color:#666">
 <th style="padding:6px 4px">日期</th><th style="text-align:right">开盘</th><th style="text-align:right">最高</th>
 <th style="text-align:right">最低</th><th style="text-align:right">收盘</th><th style="text-align:right">涨跌幅</th>
+<th style="text-align:right">采样</th>
 </tr></thead>
 <tbody>${trs}</tbody></table>
 
-<p style="font-size:12px;color:#aaa;margin-top:24px">
-口径说明：收盘价取自休市后 1 小时的补抓，为当日定格价；开盘为当日首次抓取的观测值，
-最高/最低为每小时采样的极值 —— 均非交易所官方 OHLC，仅供参考（美元/桶）。</p>
+${thin ? `<p style="font-size:12px;color:#c0392b;margin-top:16px">
+※ 有 ${thin} 个交易日采样不足 ${SAMPLES_MIN} 次（多为刚起步或抓取中断），
+这些日子的最高/最低已留空 —— 单次采样无法反映日内波动，不做展示。</p>` : ''}
+<p style="font-size:12px;color:#aaa;margin-top:16px">
+口径说明：本站为自建累积，<b>非交易所官方 OHLC</b>。每小时采样一次，伦敦交易时段
+（01:00–23:00）理论最多约 22 个点，真实日内高低点很可能落在两次采样之间，
+因此最高/最低仅供参考、不等于官方日内极值。收盘价为休市后补抓的当日最终观测价，
+定格后不再变动；涨跌幅按「收盘对收盘」计算，两端口径一致，相对最可信（美元/桶）。</p>
 <p><a href="/">← 返回首页</a> · <a href="/update">手动刷新</a> · <a href="/clear-history?code=${hKey}">清空${L}历史</a></p>
 </body></html>`;
 }
