@@ -1,5 +1,5 @@
 /**
- * oil-data-worker  v2
+ * oil-data-worker  v5
  * ---------------------------------------------------------------
  * v2 改动（针对「手动刷新拉不到新数据」问题）：
  *  1. 原油：抓取时一并记录 stale（沿用值标记）与 as_of（源观测时间），
@@ -7,6 +7,17 @@
  *  2. 黄金：加每日抓取闸门 —— 定时任务无条件抓；手动刷新每天最多生效 1 次，
  *     且当天定时任务已抓过就直接跳过，保护 MetalpriceAPI 月度配额。
  *  3. 所有响应加 Cache-Control: no-store，避免中间缓存导致「点了没真发出去」。
+ *
+ * v3 改动：布伦特交易时段闸门（以伦敦本地时间判断，周六休市整天不抓）
+ * v4 改动：收盘补抓（休市后 1 小时再抓一次，钉死当日最终价）
+ *
+ * v5 改动（本次）：
+ *  1. 新增「布伦特历史日报」—— 万维易源 ShowAPI 1108-2，每天 1 次调用
+ *     返回整段历史（开/高/低/收），存 KV 并做去重合并，日积月累成走势库。
+ *     OilPriceAPI 实时抓取逻辑原样保留，完全不动。
+ *  2. 国内油价加「每日闸门」—— 与黄金一致：cron 每天 08:00 抓一次，
+ *     手动当天已抓过则跳过（0 消耗），cron 失败才允许手动补 1 次。
+ *  3. 新增 /history 报表页（表格 + SVG 走势图）与 /test-history 自测诊断页。
  * ---------------------------------------------------------------
  */
 
@@ -16,6 +27,23 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Contr
 
 /** 黄金手动刷新每日上限（保护月度配额，1 = 每天最多手动抓 1 次） */
 const GOLD_MANUAL_MAX_PER_DAY = 1;
+
+// ============================================================
+// 万维易源 ShowAPI 1108-2 · 国际原油历史日报
+// ------------------------------------------------------------
+// ⚠️ 该接口一次只能返回「一种」原油，靠 code 参数区分：
+//      code=blt → 布伦特原油（本站在用的，唯一需要调的）
+//      code=wti → WTI 原油（本站不用，绝不调用）
+//    若两种都调，一次就要消耗 2 倍额度 —— 所以代码里写死只调 blt，
+//    并在下方加断言防止误改。
+// ============================================================
+const SHOWAPI_HISTORY_URL = 'https://route.showapi.com/1108-2';
+/** 本站只做布伦特，禁止改成 wti —— 改了报表数据就全错 */
+const HISTORY_CODE_BRENT = 'blt';
+/** 每次拉取的窗口天数（1 次调用返回整段，不是一天一次请求） */
+const HISTORY_FETCH_DAYS = 60;
+/** KV 最多保留的历史条数（约 1 年交易日） */
+const HISTORY_MAX_ROWS = 400;
 
 /** 北京时间日期串 YYYY-MM-DD（用于「每天一次」的闸门判断） */
 function beijingDateString(d = new Date()) {
@@ -119,6 +147,41 @@ function isClosingWindow(d = new Date()) {
   return hour === 0;            // 休市后 1 小时
 }
 
+// ============================================================
+// 通用「每天只抓一次」闸门
+// ------------------------------------------------------------
+// 规则（黄金 / 国内油价 / 历史日报 三处共用）：
+//   · 定时任务 → 无条件抓取
+//   · 手动刷新 → 若今天已成功抓过（marker 日期 = 今天）直接跳过，0 消耗
+//   · 手动补抓 → 定时任务失败时 marker 不会写入，手动即可补 1 次
+// 关键点：marker 只在「抓取成功后」才写，所以失败时闸门自动放行。
+// ============================================================
+function sourceLabel(s) {
+  return s === 'cron' ? '定时任务' : s === 'manual' ? '手动' : s === 'bootstrap' ? '初始化' : (s || '未知');
+}
+
+async function checkDailyGate(env, markerKey, { manual = false } = {}) {
+  if (!manual) return { skip: false, marker: null };
+  const marker = await env.OIL_KV.get(markerKey, 'json').catch(() => null);
+  const today = beijingDateString();
+  if (marker && marker.date === today) {
+    return {
+      skip: true,
+      marker,
+      reason: `今日已抓取（${sourceLabel(marker.source)}），跳过以省额度`,
+    };
+  }
+  return { skip: false, marker };
+}
+
+async function markDailyFetched(env, markerKey, source) {
+  await env.OIL_KV.put(
+    markerKey,
+    JSON.stringify({ date: beijingDateString(), source, at: beijingNow() }),
+    { expirationTtl: 86400 * 3 }
+  );
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -218,7 +281,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
 
 <p style="font-size:14px;color:#666">🕐 你的本地时间：<span id="localTime"></span> <span style="font-size:12px;color:#999" id="tz"></span></p>
 <p style="font-size:12px;color:#aaa">以上为国际原料与成品油参考价，非零售汽油价 / 首饰金价。黄金为延迟日更参考价，不代表实时盘中报价。</p>
-<p style="font-size:12px;color:#aaa"><a href="https://metalpriceapi.com" target="_blank" rel="noopener">Data provided by MetalpriceAPI</a> · <a href="/update">手动刷新</a> · <a href="/data">原始JSON</a></p>
+<p style="font-size:12px;color:#aaa"><a href="https://metalpriceapi.com" target="_blank" rel="noopener">Data provided by MetalpriceAPI</a> · <a href="/update">手动刷新</a> · <a href="/history">📈 历史报表</a> · <a href="/test-history">报表自测</a> · <a href="/data">原始JSON</a></p>
 
 <script>
   var d = new Date('${displayUTC}');
@@ -244,11 +307,14 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
 
     // ---------------- /data ----------------
     if (url.pathname === '/data') {
-      const [oil, gold, cn, marker] = await Promise.all([
+      const [oil, gold, cn, marker, hist, cnMarker, histMarker] = await Promise.all([
         env.OIL_KV.get('oil_data', 'json'),
         env.OIL_KV.get('gold_data', 'json'),
         env.OIL_KV.get('cn_oil_data', 'json'),
         env.OIL_KV.get('gold_fetch_marker', 'json'),
+        env.OIL_KV.get('brent_history', 'json'),
+        env.OIL_KV.get('cn_oil_fetch_marker', 'json'),
+        env.OIL_KV.get('brent_history_marker', 'json'),
       ]);
       const now = new Date();
       return new Response(JSON.stringify({
@@ -265,7 +331,29 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
         gold,
         cn_oil: cn,
         goldFetchMarker: marker || null,
+        cnOilFetchMarker: cnMarker || null,
+        // 布伦特历史日报（万维易源 1108-2，每日 1 次）
+        brentHistory: hist ? {
+          code: hist.code,
+          updatedLocal: hist.updatedLocal,
+          rows: hist.rows?.length ?? 0,
+          latest: hist.rows?.[hist.rows.length - 1] ?? null,
+          note: '完整数组见 /history 页面或原始数据 KV',
+        } : null,
+        brentHistoryMarker: histMarker || null,
       }, null, 2), { headers: JSON_HEADERS });
+    }
+
+    // ---------------- /history 报表页 ----------------
+    if (url.pathname === '/history') {
+      return new Response(await renderHistoryPage(env), { headers: HTML_HEADERS });
+    }
+
+    // ---------------- /test-history 自测诊断 ----------------
+    if (url.pathname === '/test-history') {
+      const force = url.searchParams.get('force') === '1';
+      const r = await probeHistory(env, { force });
+      return new Response(r, { headers: TEXT_HEADERS });
     }
 
     // ---------------- /update ----------------
@@ -273,7 +361,8 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
       const results = await Promise.allSettled([
         fetchAndSave(env, false),
         fetchGoldAndSave(env, { manual: true }),
-        fetchCnOilAll(env),
+        fetchCnOilAll(env, { manual: true }),
+        fetchBrentHistory(env, { manual: true }),
       ]);
 
       const line = (name, r) => {
@@ -316,9 +405,35 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
       // 国内油价详情
       let cnDetail = '';
       if (cnR.status === 'fulfilled' && cnR.value) {
-        cnDetail = `    省份数 : ${cnR.value.list?.length ?? 0}   数据源 : ${cnR.value.source}`;
+        const v = cnR.value;
+        if (v.skipped) {
+          cnDetail = `    原因 : ${v.reason}
+    当前值 : ${v.list?.length ?? 0} 个省份（源时间 ${v.updatedAt ?? '—'}）`;
+        } else {
+          cnDetail = `    省份数 : ${v.list?.length ?? 0}   数据源 : ${v.source}`;
+        }
       } else if (cnR.status === 'rejected') {
         cnDetail = `    原因 : ${cnR.reason?.message || cnR.reason}`;
+      }
+
+      // 历史日报详情
+      const histR = results[3];
+      let histDetail = '';
+      if (histR.status === 'fulfilled') {
+        const v = histR.value;
+        if (v?.skipped) {
+          histDetail = `    原因 : ${v.reason}
+    已有条数 : ${v.data?.rows?.length ?? 0}`;
+        } else if (v?.data) {
+          histDetail = `    拉取品种 : ${v.data.code}（blt=布伦特，未调 WTI，仅消耗 1 次额度）
+    区间     : ${v.data.range?.begin ?? '—'} ~ ${v.data.range?.end ?? '—'}
+    本次返回 : ${v.data.fetchedCount ?? 0} 条
+    累计条数 : ${v.data.rows?.length ?? 0} 条
+    最新一条 : ${v.data.rows?.length ? JSON.stringify(v.data.rows[v.data.rows.length - 1]) : '—'}`;
+        }
+      } else {
+        histDetail = `    原因 : ${histR.reason?.message || histR.reason}
+    提示 : 若提示 ret_code 非 0，多半是 1108 未在万维易源后台开通，需单独免费订购`;
       }
 
       const txt = `${line('原油', oilR)}
@@ -329,6 +444,9 @@ ${goldDetail}
 
 ${line('国内油价', cnR)}
 ${cnDetail}
+
+${line('历史日报', histR)}
+${histDetail}
 
 北京时间 : ${beijingNow()}
 `;
@@ -350,6 +468,11 @@ ${cnDetail}
 
     // 国内油价：每天 08:00 一次（万维易源 7-8 点更新后再拉）
     if (h === 8) jobs.push(fetchCnOilAll(env));
+
+    // 布伦特历史日报：每天 09:00 一次（万维易源 1108-2，1 次调用返回整段）
+    // 为什么是 09:00：伦敦 23:00 收盘 = 北京 06:00(夏令) / 07:00(冬令)，
+    // 留 2~3 小时缓冲，确保拿到的是「已结算完整」的前一日日报。
+    if (h === 9) jobs.push(fetchBrentHistory(env, { manual: false }));
 
     // 原油：交易时段每小时抓 + 休市后 1 小时补抓一次（钉死当日最终价）
     const trading = isBrentTrading(now);
@@ -501,7 +624,17 @@ async function fetchBackup() {
   return out;
 }
 
-async function fetchCnOilAll(env) {
+async function fetchCnOilAll(env, { manual = false } = {}) {
+  const cached = await env.OIL_KV.get('cn_oil_data', 'json').catch(() => null);
+
+  // 每日闸门：手动刷新时，今天已成功抓过就直接跳过（0 消耗）
+  if (manual) {
+    const gate = await checkDailyGate(env, 'cn_oil_fetch_marker', { manual: true });
+    if (gate.skip) {
+      return { ...(cached || {}), skipped: true, reason: gate.reason, data: cached };
+    }
+  }
+
   let list, source;
   try {
     list = await fetchShowAPI(env);
@@ -518,5 +651,268 @@ async function fetchCnOilAll(env) {
     note: '各省最高零售限价，约每10个工作日调整一次',
   };
   await env.OIL_KV.put('cn_oil_data', JSON.stringify(result), { expirationTtl: 86400 * 15 });
+  await markDailyFetched(env, 'cn_oil_fetch_marker', manual ? 'manual' : 'cron');
   return result;
+}
+
+// ============================================================
+// 布伦特历史日报（万维易源 ShowAPI 1108-2）
+// ------------------------------------------------------------
+// · 每天仅 1 次调用，返回整段区间（不是一天一条请求）
+// · 只调 code=blt（布伦特）。绝不调 wti —— 本站用不上，且会多耗 1 倍额度
+// · 新数据按 day 去重合并进 KV，日积月累形成走势库（最多 400 条约 1 年）
+// · 官方字段：day / open_price / close_price / max / min / diff（涨跌幅）
+//   不同供应商字段名可能略有差异，下面做了多候选兼容
+// ============================================================
+function ymd(d, sep = '') {
+  const s = beijingDateString(d);
+  return sep ? s.replace(/-/g, sep) : s;
+}
+
+function toNum(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = typeof v === 'string' ? parseFloat(v.replace(/,/g, '')) : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeRow(r) {
+  if (!r) return null;
+  const day = String(r.day || r.date || r.tradeDate || r.time || '').slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
+  const row = {
+    day,
+    open:  toNum(r.open_price ?? r.openPrice ?? r.open ?? r.today_openPrice),
+    high:  toNum(r.max ?? r.max_price ?? r.high ?? r.high_price ?? r.todayMax),
+    low:   toNum(r.min ?? r.min_price ?? r.low ?? r.low_price ?? r.todayMin),
+    close: toNum(r.close_price ?? r.closePrice ?? r.close ?? r.price ?? r.nowPrice),
+  };
+  if (row.close == null) return null;   // 没有收盘价的记录直接丢弃
+  const diff = toNum(r.diff ?? r.diff_rate ?? r.change ?? r.changeRate);
+  if (diff != null) row.diff = diff;
+  const vol = toNum(r.trade_num ?? r.volume ?? r.tradeNum);
+  if (vol != null) row.vol = vol;
+  return row;
+}
+
+async function fetchBrentHistory(env, { manual = false, days = HISTORY_FETCH_DAYS } = {}) {
+  const cached = await env.OIL_KV.get('brent_history', 'json').catch(() => null);
+
+  // 每日闸门：手动刷新时，今天已成功抓过就跳过（0 消耗）
+  if (manual) {
+    const gate = await checkDailyGate(env, 'brent_history_marker', { manual: true });
+    if (gate.skip) {
+      return { data: cached, skipped: true, reason: gate.reason };
+    }
+  }
+
+  const appKey = env.SHOWAPI_APPKEY;
+  if (!appKey) throw new Error('Missing SHOWAPI_APPKEY');
+
+  // ⚠️ 断言：只能是布伦特。若哪天被误改成 wti，这里直接报错，防止报表数据全错
+  if (HISTORY_CODE_BRENT !== 'blt') {
+    throw new Error('HISTORY_CODE 被改成了非布伦特品种，已阻止');
+  }
+
+  const end = new Date();
+  const begin = new Date(end.getTime() - days * 86400 * 1000);
+  const qs = new URLSearchParams({
+    appKey,
+    code: HISTORY_CODE_BRENT,
+    begin: ymd(begin),
+    end: ymd(end),
+  });
+
+  const res = await fetch(`${SHOWAPI_HISTORY_URL}?${qs.toString()}`, {
+    headers: { 'Accept': 'application/json' },
+    cf: { cacheTtl: 0 },
+  });
+  if (!res.ok) throw new Error(`ShowAPI 1108-2 HTTP ${res.status}`);
+
+  const json = await res.json();
+  if (json.showapi_res_code !== 0) {
+    throw new Error(`ShowAPI 网关错误 ${json.showapi_res_code}: ${json.showapi_res_error || '（多半是 1108 未开通，请到后台免费订购）'}`);
+  }
+  const body = json.showapi_res_body || {};
+  if (body.ret_code !== 0) {
+    throw new Error(`ShowAPI 1108-2 ret_code=${body.ret_code} ${body.ret_message || body.remark || '（多半是 1108 未开通，请到后台免费订购）'}`);
+  }
+
+  const raw = body.list || body.data || body.dataList || [];
+  const fetched = raw.map(normalizeRow).filter(Boolean);
+
+  // 与已有数据按 day 去重合并（新数据覆盖旧数据），按日期升序
+  const map = new Map();
+  for (const r of (cached?.rows || [])) map.set(r.day, r);
+  for (const r of fetched) map.set(r.day, r);
+  const rows = [...map.values()]
+    .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0))
+    .slice(-HISTORY_MAX_ROWS);
+
+  const data = {
+    code: HISTORY_CODE_BRENT,
+    label: '布伦特原油',
+    range: { begin: ymd(begin), end: ymd(end) },
+    fetchedCount: fetched.length,
+    rows,
+    updatedLocal: beijingNow(),
+  };
+
+  await env.OIL_KV.put('brent_history', JSON.stringify(data));  // 历史数据不设过期，永久累积
+  await markDailyFetched(env, 'brent_history_marker', manual ? 'manual' : 'cron');
+  return { data, skipped: false };
+}
+
+// ---------------- 报表页渲染 ----------------
+async function renderHistoryPage(env) {
+  const hist = await env.OIL_KV.get('brent_history', 'json').catch(() => null);
+  const rows = hist?.rows || [];
+
+  if (!rows.length) {
+    return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>历史报表</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 20px">
+<h1>📈 布伦特原油历史报表</h1>
+<p>暂无数据。请按下面两步操作：</p>
+<ol>
+<li>先访问 <a href="/test-history">/test-history</a> 自测，看接口是否返回 <code>ret_code: 0</code></li>
+<li>若提示未开通，到万维易源后台<b>免费订购 1108</b> 接口（138-46 是另一个接口，需单独开通）</li>
+<li>开通后访问 <a href="/update">/update</a> 拉一次</li>
+</ol>
+<p><a href="/">← 返回首页</a></p></body></html>`;
+  }
+
+  const show = rows.slice(-60);   // 页面最多展示最近 60 条
+  const vals = show.map(r => r.close).filter(v => v != null);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const first = vals[0], last = vals[vals.length - 1];
+  const totalChange = last - first;
+  const totalPct = first ? (totalChange / first * 100) : 0;
+  const upColor = '#27ae60', downColor = '#c0392b';
+  const trendColor = totalChange >= 0 ? upColor : downColor;
+
+  // SVG 走势图
+  const W = 680, H = 180, PAD = 10;
+  const span = (max - min) || 1;
+  const pts = show.map((r, i) => {
+    const x = PAD + (W - PAD * 2) * (show.length === 1 ? 0.5 : i / (show.length - 1));
+    const y = H - PAD - (H - PAD * 2) * ((r.close - min) / span);
+    return [x, y];
+  });
+  const line = pts.map((p, i) => `${i ? 'L' : 'M'}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' ');
+  const area = `${line} L${pts[pts.length - 1][0].toFixed(1)},${H - PAD} L${pts[0][0].toFixed(1)},${H - PAD} Z`;
+
+  const trs = show.slice().reverse().map(r => {
+    const d = toNum(r.diff);
+    const c = d == null ? '#999' : (d >= 0 ? upColor : downColor);
+    const sign = d == null ? '—' : (d >= 0 ? '+' : '') + d.toFixed(2) + '%';
+    return `<tr style="border-bottom:1px solid #eee">
+<td style="padding:6px 4px">${r.day}</td>
+<td style="padding:6px 4px;text-align:right">${r.open ?? '—'}</td>
+<td style="padding:6px 4px;text-align:right">${r.high ?? '—'}</td>
+<td style="padding:6px 4px;text-align:right">${r.low ?? '—'}</td>
+<td style="padding:6px 4px;text-align:right"><b>${r.close}</b></td>
+<td style="padding:6px 4px;text-align:right;color:${c}">${sign}</td></tr>`;
+  }).join('');
+
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>布伦特原油历史报表</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;color:#222">
+<h1>📈 布伦特原油 · 历史日报表</h1>
+<p style="font-size:13px;color:#888">数据源：万维易源 ShowAPI 1108-2 · 品种 blt（布伦特）· 更新：${hist.updatedLocal || '—'} · 共 ${rows.length} 条</p>
+
+<div style="display:flex;gap:24px;flex-wrap:wrap;margin:16px 0">
+<div><div style="font-size:12px;color:#888">最新收盘</div><div style="font-size:26px;font-weight:600">$${last}</div></div>
+<div><div style="font-size:12px;color:#888">区间涨跌</div><div style="font-size:26px;font-weight:600;color:${trendColor}">${totalChange >= 0 ? '+' : ''}${totalChange.toFixed(2)} (${totalPct >= 0 ? '+' : ''}${totalPct.toFixed(2)}%)</div></div>
+<div><div style="font-size:12px;color:#888">区间最高 / 最低</div><div style="font-size:26px;font-weight:600">${max} / ${min}</div></div>
+</div>
+
+<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;border:1px solid #eee;border-radius:8px;background:#fafafa">
+<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+<stop offset="0%" stop-color="${trendColor}" stop-opacity="0.25"/>
+<stop offset="100%" stop-color="${trendColor}" stop-opacity="0"/></linearGradient></defs>
+<path d="${area}" fill="url(#g)"/>
+<path d="${line}" fill="none" stroke="${trendColor}" stroke-width="2"/>
+</svg>
+<p style="font-size:12px;color:#aaa;text-align:right">${show[0].day} → ${show[show.length - 1].day}</p>
+
+<h2 style="margin-top:28px;font-size:18px">明细（最近 ${show.length} 个交易日）</h2>
+<table style="width:100%;border-collapse:collapse;font-size:14px">
+<thead><tr style="border-bottom:2px solid #ddd;text-align:left;color:#666">
+<th style="padding:6px 4px">日期</th><th style="text-align:right">开盘</th><th style="text-align:right">最高</th>
+<th style="text-align:right">最低</th><th style="text-align:right">收盘</th><th style="text-align:right">涨跌幅</th>
+</tr></thead>
+<tbody>${trs}</tbody></table>
+
+<p style="font-size:12px;color:#aaa;margin-top:24px">口径说明：以上为数据源提供的每日开/高/低/收报价（美元/桶），供参考，非交易所官方结算价。</p>
+<p><a href="/">← 返回首页</a> · <a href="/test-history">接口自测</a> · <a href="/update">手动刷新</a></p>
+</body></html>`;
+}
+
+// ---------------- 自测诊断 ----------------
+async function probeHistory(env, { force = false } = {}) {
+  const appKey = env.SHOWAPI_APPKEY;
+  const out = [];
+  out.push(`=== 万维易源 1108-2 自测 ===`);
+  out.push(`北京时间 : ${beijingNow()}`);
+  out.push(`AppKey   : ${appKey ? '已配置（' + String(appKey).slice(0, 4) + '****' + String(appKey).slice(-4) + '）' : '❌ 未配置 SHOWAPI_APPKEY'}`);
+  if (!appKey) return out.join('\n');
+
+  const end = new Date();
+  const begin = new Date(end.getTime() - 7 * 86400 * 1000);
+  const qs = new URLSearchParams({ appKey, code: HISTORY_CODE_BRENT, begin: ymd(begin), end: ymd(end) });
+  const url = `${SHOWAPI_HISTORY_URL}?${qs.toString()}`;
+  out.push(`请求品种 : ${HISTORY_CODE_BRENT}（blt=布伦特；未调 wti，本次仅消耗 1 次额度）`);
+  out.push(`请求区间 : ${ymd(begin)} ~ ${ymd(end)}`);
+  if (force) out.push(`force=1 → 忽略每日闸门，强制发请求（会消耗 1 次额度）`);
+
+  if (!force) {
+    const marker = await env.OIL_KV.get('brent_history_marker', 'json').catch(() => null);
+    if (marker && marker.date === beijingDateString()) {
+      out.push('');
+      out.push(`⏭️ 今日已抓取（${sourceLabel(marker.source)}），为省额度未发请求。`);
+      const hist = await env.OIL_KV.get('brent_history', 'json').catch(() => null);
+      out.push(`   当前 KV 已有 ${hist?.rows?.length ?? 0} 条，最新一条：`);
+      out.push(`   ${hist?.rows?.length ? JSON.stringify(hist.rows[hist.rows.length - 1]) : '—'}`);
+      out.push(`   要看真实接口返回，请访问 /test-history?force=1`);
+      return out.join('\n');
+    }
+  }
+
+  try {
+    const res = await fetch(url, { headers: { 'Accept': 'application/json' }, cf: { cacheTtl: 0 } });
+    out.push('');
+    out.push(`HTTP 状态 : ${res.status}`);
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch (e) {
+      out.push(`❌ 返回不是 JSON（前 300 字符）：`);
+      out.push(text.slice(0, 300));
+      return out.join('\n');
+    }
+    out.push(`网关码 showapi_res_code : ${json.showapi_res_code} ${json.showapi_res_error ? '(' + json.showapi_res_error + ')' : ''}`);
+    const body = json.showapi_res_body || {};
+    out.push(`业务码 ret_code         : ${body.ret_code} ${body.ret_message || body.remark || ''}`);
+    if (json.showapi_res_code !== 0 || body.ret_code !== 0) {
+      out.push('');
+      out.push('❌ 未拿到数据。最常见原因：1108 接口未在万维易源后台开通。');
+      out.push('   处理：登录 showapi.com → 接口市场搜「1108 国际原油价格」→ 免费订购 → 再试');
+      out.push('   （138-46 国内油价是另一个接口，订购它不代表 1108 已开通）');
+      return out.join('\n');
+    }
+    const raw = body.list || body.data || body.dataList || [];
+    out.push(`返回条数 : ${raw.length}`);
+    if (raw.length) {
+      out.push(`首条原始 : ${JSON.stringify(raw[0])}`);
+      const norm = raw.map(normalizeRow).filter(Boolean);
+      out.push(`解析成功 : ${norm.length} 条 / ${raw.length} 条`);
+      if (norm.length) out.push(`解析样例 : ${JSON.stringify(norm[norm.length - 1])}`);
+      if (norm.length < raw.length) out.push(`⚠️ 有 ${raw.length - norm.length} 条因缺收盘价被丢弃`);
+    }
+    out.push('');
+    out.push('✅ 接口可用。现在访问 /update 拉一次正式数据，然后打开 /history 看报表。');
+  } catch (e) {
+    out.push('');
+    out.push(`❌ 请求异常 : ${e.message}`);
+  }
+  return out.join('\n');
 }
