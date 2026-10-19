@@ -53,6 +53,15 @@ const BRENT_CODE = 'BRENT_CRUDE_USD';
 const WTI_CODE = 'WTI_USD';
 const OIL_LATEST_BASE = 'https://api.oilpriceapi.com/v1/prices/latest';
 
+// 两个品种的历史走势配置（共用 recordDailyHistory，只是 KV key 和标题不同）
+const HISTORY_SPECS = {
+  brent: { kvKey: 'brent_history', label: '布伦特原油', code: BRENT_CODE },
+  wti:   { kvKey: 'wti_history',   label: 'WTI 原油',   code: WTI_CODE },
+};
+function historySpec(key) {
+  return HISTORY_SPECS[key] || HISTORY_SPECS.brent;   // 未知 key 一律回落布伦特，不会写脏 KV
+}
+
 // ============================================================
 // 布伦特历史走势 —— 自建累积（已移除万维易源 ShowAPI 1108-2）
 // ------------------------------------------------------------
@@ -344,7 +353,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
 
 <p style="font-size:14px;color:#666">🕐 你的本地时间：<span id="localTime"></span> <span style="font-size:12px;color:#999" id="tz"></span></p>
 <p style="font-size:12px;color:#aaa">以上为国际原料与成品油参考价，非零售汽油价 / 首饰金价。黄金为延迟日更参考价，不代表实时盘中报价。</p>
-<p style="font-size:12px;color:#aaa"><a href="https://metalpriceapi.com" target="_blank" rel="noopener">Data provided by MetalpriceAPI</a> · <a href="/update">手动刷新</a> · <a href="/history">📈 历史走势</a> · <a href="/data">原始JSON</a></p>
+<p style="font-size:12px;color:#aaa"><a href="https://metalpriceapi.com" target="_blank" rel="noopener">Data provided by MetalpriceAPI</a> · <a href="/update">手动刷新</a> · <a href="/history">📈 布伦特走势</a> · <a href="/history?code=wti">📈 WTI走势</a> · <a href="/data">原始JSON</a></p>
 
 <script>
   var d = new Date('${displayUTC}');
@@ -370,7 +379,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
 
     // ---------------- /data ----------------
     if (url.pathname === '/data') {
-      const [oil, gold, cn, marker, hist, cnMarker, wti] = await Promise.all([
+      const [oil, gold, cn, marker, hist, cnMarker, wti, wtiHist] = await Promise.all([
         env.OIL_KV.get('oil_data', 'json'),
         env.OIL_KV.get('gold_data', 'json'),
         env.OIL_KV.get('cn_oil_data', 'json'),
@@ -378,6 +387,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
         env.OIL_KV.get('brent_history', 'json'),
         env.OIL_KV.get('cn_oil_fetch_marker', 'json'),
         env.OIL_KV.get('wti_data', 'json'),
+        env.OIL_KV.get('wti_history', 'json'),
       ]);
       const now = new Date();
       return new Response(JSON.stringify({
@@ -404,32 +414,44 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
           latest: hist.rows?.[hist.rows.length - 1] ?? null,
           note: '完整数组见 /history 页面；数据来自本站自身抓取的实时价，非第三方历史接口',
         } : null,
+        // WTI 历史走势（与布伦特同一套规则累积，零额外额度）
+        wtiHistory: wtiHist ? {
+          mode: 'self-built',
+          updatedLocal: wtiHist.updatedLocal,
+          rows: wtiHist.rows?.length ?? 0,
+          latest: wtiHist.rows?.[wtiHist.rows.length - 1] ?? null,
+          note: '完整数组见 /history?code=wti 页面；数据来自本站自身抓取的实时价',
+        } : null,
       }, null, 2), { headers: JSON_HEADERS });
     }
 
     // ---------------- /history 报表页 ----------------
     if (url.pathname === '/history') {
-      return new Response(await renderHistoryPage(env), { headers: HTML_HEADERS });
+      const hKey = url.searchParams.get('code') === 'wti' ? 'wti' : 'brent';
+      return new Response(await renderHistoryPage(env, hKey), { headers: HTML_HEADERS });
     }
 
     // ---------------- /clear-history 清空历史（自建累积，随时可重来）----------------
     if (url.pathname === '/clear-history') {
       const confirm = url.searchParams.get('confirm') === '1';
+      const hKey = url.searchParams.get('code') === 'wti' ? 'wti' : 'brent';
+      const spec = historySpec(hKey);
       if (!confirm) {
-        const cur = await env.OIL_KV.get('brent_history', 'json').catch(() => null);
+        const cur = await env.OIL_KV.get(spec.kvKey, 'json').catch(() => null);
         return new Response(
-          `=== 清空布伦特历史走势 ===\n` +
+          `=== 清空 ${spec.label} 历史走势 ===\n` +
+          `品种 : ${spec.label}（${spec.code}）\n` +
           `当前条数 : ${cur?.rows?.length ?? 0}\n` +
           `日期范围 : ${cur?.rows?.length ? cur.rows[0].day + ' ~ ' + cur.rows[cur.rows.length - 1].day : '—'}\n\n` +
-          `⚠️ 此操作会删除 KV 中的 brent_history，且不可恢复。\n` +
-          `确认请访问：/clear-history?confirm=1\n`,
+          `⚠️ 此操作会删除 KV 中的 ${spec.kvKey}，且不可恢复。\n` +
+          `确认请访问：/clear-history?code=${hKey}&confirm=1\n` +
+          `（清空另一个品种：/clear-history?code=${hKey === 'wti' ? 'brent' : 'wti'}&confirm=1）\n`,
           { headers: TEXT_HEADERS }
         );
       }
-      await env.OIL_KV.delete('brent_history').catch(() => {});
-      await env.OIL_KV.delete('brent_history_marker').catch(() => {});
+      await env.OIL_KV.delete(spec.kvKey).catch(() => {});
       return new Response(
-        `✅ 已清空 brent_history（含残留的 brent_history_marker）。\n` +
+        `✅ 已清空 ${spec.kvKey}（${spec.label}）。\n` +
         `历史走势将从下一次抓取重新开始累积。\n`,
         { headers: TEXT_HEADERS }
       );
@@ -497,14 +519,20 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
         cnDetail = `    原因 : ${cnR.reason?.message || cnR.reason}`;
       }
 
-      // 历史走势（自建累积，零额外额度）
-      const hist = await env.OIL_KV.get('brent_history', 'json').catch(() => null);
+      // 历史走势（自建累积，零额外额度）—— 布伦特 + WTI 各一份
+      const [hist, wHist] = await Promise.all([
+        env.OIL_KV.get('brent_history', 'json').catch(() => null),
+        env.OIL_KV.get('wti_history', 'json').catch(() => null),
+      ]);
       const rows = hist?.rows || [];
-      const histDetail = rows.length
-        ? `    累计条数 : ${rows.length} 条   日期范围 : ${rows[0].day} ~ ${rows[rows.length - 1].day}
-    最新一条 : ${JSON.stringify(rows[rows.length - 1])}
-    说明     : 自建累积（复用本次抓取，未额外消耗额度）`
-        : `    累计条数 : 0 条（下一次抓取后开始累积）`;
+      const wRows = wHist?.rows || [];
+      const histLine = (name, rs) => rs.length
+        ? `    ${name} : ${rs.length} 条   日期范围 : ${rs[0].day} ~ ${rs[rs.length - 1].day}
+        最新一条 : ${JSON.stringify(rs[rs.length - 1])}`
+        : `    ${name} : 0 条（下一次抓取后开始累积）`;
+      const histDetail = `${histLine('布伦特', rows)}
+${histLine('WTI  ', wRows)}
+    说明     : 自建累积（复用本次抓取，未额外消耗额度）`;
 
       const txt = `${line('原油', oilR)}
 ${oilDetail}
@@ -609,10 +637,24 @@ async function fetchAndSave(env, isClosing = false) {
       sourceMode: mode,
     };
     await env.OIL_KV.put('wti_data', JSON.stringify(wti), { expirationTtl: 86400 * 2 });
+
+    // WTI 同样攒走势 —— 与布伦特完全同一套规则、同一时刻写入，零额外额度。
+    // 失败也不影响布伦特（各自独立 catch）。
+    await recordDailyHistory(env, {
+      price: wti.price,
+      isClosing: !!isClosing,
+      kvKey: 'wti_history',
+      label: 'WTI 原油',
+    }).catch(() => {});
   }
 
   // 顺手把本次价格记进历史走势（自建累积，零额外额度）
-  await recordDailyHistory(env, { price: result.price, isClosing: !!isClosing }).catch(() => {});
+  await recordDailyHistory(env, {
+    price: result.price,
+    isClosing: !!isClosing,
+    kvKey: 'brent_history',
+    label: '布伦特原油',
+  }).catch(() => {});
 
   return { data: result, wti, prev, skipped: false };
 }
@@ -715,8 +757,10 @@ function isWeekdayInLondon(day) {
 //
 // 只在「交易时段」或「收盘补抓窗口」记录 —— 周末休市时 API 返回的是沿用值，
 // 记进去会污染走势。
+//
+// 布伦特与 WTI 共用此函数，靠 kvKey 区分（同一套规则、同一时刻写入）。
 // ============================================================
-async function recordDailyHistory(env, { price, isClosing }) {
+async function recordDailyHistory(env, { price, isClosing, kvKey = 'brent_history', label = '布伦特原油' }) {
   const num = Number(price);
   if (!Number.isFinite(num)) return null;
 
@@ -729,7 +773,7 @@ async function recordDailyHistory(env, { price, isClosing }) {
   // tradingDateString 会往前推回周五，所以不受影响）。
   if (!isWeekdayInLondon(day)) return null;
 
-  const hist = await env.OIL_KV.get('brent_history', 'json').catch(() => null);
+  const hist = await env.OIL_KV.get(kvKey, 'json').catch(() => null);
   const rows = Array.isArray(hist?.rows) ? hist.rows.slice() : [];
 
   let row = rows.find(r => r.day === day);
@@ -766,11 +810,11 @@ async function recordDailyHistory(env, { price, isClosing }) {
 
   const data = {
     mode: 'self-built',
-    label: '布伦特原油',
+    label,
     updatedLocal: beijingNow(),
     rows: kept,
   };
-  await env.OIL_KV.put('brent_history', JSON.stringify(data));   // 永久累积，不设过期
+  await env.OIL_KV.put(kvKey, JSON.stringify(data));   // 永久累积，不设过期
   return data;
 }
 
@@ -909,14 +953,23 @@ function toNum(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-async function renderHistoryPage(env) {
-  const hist = await env.OIL_KV.get('brent_history', 'json').catch(() => null);
+async function renderHistoryPage(env, hKey = 'brent') {
+  const spec = historySpec(hKey);
+  const hist = await env.OIL_KV.get(spec.kvKey, 'json').catch(() => null);
   const rows = hist?.rows || [];
+  const L = spec.label;   // 标题里的品种名
+
+  // 页面顶部切换品种的链接
+  const switchLink = `<p style="font-size:13px">切换品种：`
+    + `<a href="/history">📈 ${HISTORY_SPECS.brent.label}</a> · `
+    + `<a href="/history?code=wti">📈 ${HISTORY_SPECS.wti.label}</a>`
+    + ` ｜ 当前：<b>${L}</b></p>`;
 
   if (!rows.length) {
     return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>历史报表</title></head>
 <body style="font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 20px">
-<h1>📈 布伦特原油历史走势</h1>
+<h1>📈 ${L} · 历史走势</h1>
+${switchLink}
 <p>暂无数据 —— 历史走势是<b>自建累积</b>的：每次 cron 抓取实时价时顺便记一条，
 每天一组开/高/低/收，日积月累形成走势。</p>
 <p>第一次抓取后就会出现第一条，之后每天自动增加。中间不会额外消耗 API 额度。</p>
@@ -959,10 +1012,11 @@ async function renderHistoryPage(env) {
 
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>布伦特原油历史报表</title></head>
+<title>${L}历史报表</title></head>
 <body style="font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;color:#222">
-<h1>📈 布伦特原油 · 历史走势</h1>
+<h1>📈 ${L} · 历史走势</h1>
 <p style="font-size:13px;color:#888">自建累积（本站自身抓取的实时价）· 更新：${hist.updatedLocal || '—'} · 共 ${rows.length} 个交易日</p>
+${switchLink}
 
 <div style="display:flex;gap:24px;flex-wrap:wrap;margin:16px 0">
 <div><div style="font-size:12px;color:#888">最新收盘</div><div style="font-size:26px;font-weight:600">$${last}</div></div>
@@ -990,6 +1044,6 @@ async function renderHistoryPage(env) {
 <p style="font-size:12px;color:#aaa;margin-top:24px">
 口径说明：收盘价取自休市后 1 小时的补抓，为当日定格价；开盘为当日首次抓取的观测值，
 最高/最低为每小时采样的极值 —— 均非交易所官方 OHLC，仅供参考（美元/桶）。</p>
-<p><a href="/">← 返回首页</a> · <a href="/update">手动刷新</a> · <a href="/clear-history">清空历史</a></p>
+<p><a href="/">← 返回首页</a> · <a href="/update">手动刷新</a> · <a href="/clear-history?code=${hKey}">清空${L}历史</a></p>
 </body></html>`;
 }
