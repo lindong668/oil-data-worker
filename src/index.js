@@ -1031,6 +1031,11 @@ ${switchLink}
 <td style="padding:6px 4px;text-align:right;color:${enough ? '#888' : '#c0392b'};font-size:12px">${n}${enough ? '' : ' ※'}</td></tr>`;
   }).join('');
 
+  // 只有 1 个交易日时，涨跌与区间高低在数学上必然是 0 和「两个相同值」——
+  // 显示出来既无意义又像编造的数据，直接留空并说明原因。
+  const enoughDays = show.length >= 2;
+  const na = '<div style="font-size:26px;font-weight:600;color:#bbb">—</div>';
+
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${L}历史报表</title></head>
@@ -1041,9 +1046,16 @@ ${switchLink}
 
 <div style="display:flex;gap:24px;flex-wrap:wrap;margin:16px 0">
 <div><div style="font-size:12px;color:#888">最新收盘</div><div style="font-size:26px;font-weight:600">$${last}</div></div>
-<div><div style="font-size:12px;color:#888">区间涨跌</div><div style="font-size:26px;font-weight:600;color:${trendColor}">${totalChange >= 0 ? '+' : ''}${totalChange.toFixed(2)} (${totalPct >= 0 ? '+' : ''}${totalPct.toFixed(2)}%)</div></div>
-<div><div style="font-size:12px;color:#888">区间收盘高 / 低</div><div style="font-size:26px;font-weight:600">${max} / ${min}</div></div>
+<div><div style="font-size:12px;color:#888">区间涨跌</div>${enoughDays
+  ? `<div style="font-size:26px;font-weight:600;color:${trendColor}">${totalChange >= 0 ? '+' : ''}${totalChange.toFixed(2)} (${totalPct >= 0 ? '+' : ''}${totalPct.toFixed(2)}%)</div>`
+  : na}</div>
+<div><div style="font-size:12px;color:#888">区间收盘高 / 低</div>${enoughDays
+  ? `<div style="font-size:26px;font-weight:600">${max} / ${min}</div>`
+  : na}</div>
 </div>
+${enoughDays ? '' : `<p style="font-size:13px;color:#c0392b;margin:0 0 8px">
+目前只有 ${show.length} 个交易日 —— 涨跌与区间高低需要至少 2 天才能计算，暂时留空。
+每天自动累积，攒够 2 天即可显示。</p>`}
 
 <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;border:1px solid #eee;border-radius:8px;background:#fafafa">
 <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
