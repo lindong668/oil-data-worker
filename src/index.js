@@ -675,23 +675,73 @@ function toNum(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+// 日期归一化：兼容 2026-10-19 / 20261019 / 2026/10/19 / 2026-10-19 00:00:00
+function normalizeDay(v) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  let m = s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})/);   // 带分隔符
+  if (m) {
+    return `${m[1]}-${String(m[2]).padStart(2, '0')}-${String(m[3]).padStart(2, '0')}`;
+  }
+  m = s.match(/^(\d{4})(\d{2})(\d{2})$/);                     // 纯数字 20261019
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  return null;
+}
+
+// 依次尝试多个候选 key，取第一个能转成数字的
+function pickNum(r, keys) {
+  for (const k of keys) {
+    if (r[k] !== undefined && r[k] !== null && r[k] !== '') {
+      const n = toNum(r[k]);
+      if (n != null) return n;
+    }
+  }
+  return null;
+}
+
+const F_KEYS = {
+  open:  ['open_price', 'openPrice', 'open', 'today_openPrice', 'openprice', 'OPEN'],
+  high:  ['max', 'max_price', 'high_price', 'high', 'todayMax', 'highest', 'top', 'HIGH'],
+  low:   ['min', 'min_price', 'low_price', 'low', 'todayMin', 'lowest', 'bottom', 'LOW'],
+  close: ['close_price', 'closePrice', 'close', 'end_price', 'endPrice', 'price',
+          'nowPrice', 'settle', 'settlement', 'settlement_price', 'last', 'CLOSE'],
+  diff:  ['diff', 'diff_rate', 'change', 'changeRate', 'change_rate', 'changePercent', 'zdf'],
+  vol:   ['trade_num', 'volume', 'tradeNum', 'trade_volume', 'vol'],
+};
+
 function normalizeRow(r) {
-  if (!r) return null;
-  const day = String(r.day || r.date || r.tradeDate || r.time || '').slice(0, 10);
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
+  if (!r || typeof r !== 'object') return null;
+  const day = normalizeDay(r.day ?? r.date ?? r.tradeDate ?? r.time ?? r.dayStr ?? r.dt);
+  if (!day) return null;
+  const close = pickNum(r, F_KEYS.close);
+  if (close == null) return null;          // 没有收盘价的记录直接丢弃
   const row = {
     day,
-    open:  toNum(r.open_price ?? r.openPrice ?? r.open ?? r.today_openPrice),
-    high:  toNum(r.max ?? r.max_price ?? r.high ?? r.high_price ?? r.todayMax),
-    low:   toNum(r.min ?? r.min_price ?? r.low ?? r.low_price ?? r.todayMin),
-    close: toNum(r.close_price ?? r.closePrice ?? r.close ?? r.price ?? r.nowPrice),
+    open:  pickNum(r, F_KEYS.open),
+    high:  pickNum(r, F_KEYS.high),
+    low:   pickNum(r, F_KEYS.low),
+    close,
   };
-  if (row.close == null) return null;   // 没有收盘价的记录直接丢弃
-  const diff = toNum(r.diff ?? r.diff_rate ?? r.change ?? r.changeRate);
+  const diff = pickNum(r, F_KEYS.diff);
   if (diff != null) row.diff = diff;
-  const vol = toNum(r.trade_num ?? r.volume ?? r.tradeNum);
+  const vol = pickNum(r, F_KEYS.vol);
   if (vol != null) row.vol = vol;
   return row;
+}
+
+// 诊断：说明一条记录为什么被丢弃（给 /test-history 用）
+function diagnoseRow(r) {
+  if (!r || typeof r !== 'object') return '不是对象';
+  const rawDay = r.day ?? r.date ?? r.tradeDate ?? r.time ?? r.dayStr ?? r.dt;
+  const day = normalizeDay(rawDay);
+  if (!day) return `日期无法识别（原始值：${JSON.stringify(rawDay)}）`;
+  const close = pickNum(r, F_KEYS.close);
+  if (close == null) {
+    const tried = F_KEYS.close.filter(k => r[k] !== undefined);
+    return `收盘价无法识别。已尝试字段：${F_KEYS.close.join('/')}；` +
+           `其中存在的字段：${tried.length ? tried.map(k => `${k}=${JSON.stringify(r[k])}`).join(', ') : '（一个都没出现）'}`;
+  }
+  return null;   // 解析正常
 }
 
 async function fetchBrentHistory(env, { manual = false, days = HISTORY_FETCH_DAYS } = {}) {
@@ -737,7 +787,11 @@ async function fetchBrentHistory(env, { manual = false, days = HISTORY_FETCH_DAY
     throw new Error(`ShowAPI 1108-2 ret_code=${body.ret_code} ${body.ret_message || body.remark || '（多半是 1108 未开通，请到后台免费订购）'}`);
   }
 
-  const raw = body.list || body.data || body.dataList || [];
+  let raw = body.list || body.data || body.dataList || body.result || body.rows || [];
+  if (!Array.isArray(raw)) {
+    for (const v of Object.values(body)) { if (Array.isArray(v)) { raw = v; break; } }
+  }
+  if (!Array.isArray(raw)) raw = [];
   const fetched = raw.map(normalizeRow).filter(Boolean);
 
   // 与已有数据按 day 去重合并（新数据覆盖旧数据），按日期升序
@@ -899,14 +953,32 @@ async function probeHistory(env, { force = false } = {}) {
       out.push('   （138-46 国内油价是另一个接口，订购它不代表 1108 已开通）');
       return out.join('\n');
     }
-    const raw = body.list || body.data || body.dataList || [];
+    // 找出承载数组的那个 key（不同供应商可能叫 list / data / dataList / result ...）
+    let raw = body.list || body.data || body.dataList || body.result || body.rows || [];
+    if (!Array.isArray(raw)) {
+      for (const [k, v] of Object.entries(body)) {
+        if (Array.isArray(v)) { raw = v; out.push(`（数组实际在字段 "${k}" 下）`); break; }
+      }
+    }
+    if (!Array.isArray(raw)) raw = [];
     out.push(`返回条数 : ${raw.length}`);
     if (raw.length) {
-      out.push(`首条原始 : ${JSON.stringify(raw[0])}`);
+      out.push('');
+      out.push(`--- 完整原始返回（showapi_res_body，截断 2000 字符）---`);
+      out.push(JSON.stringify(body, null, 2).slice(0, 2000));
+      out.push(`--- 每字段逐一诊断 ---`);
+      out.push(`该条数据出现的全部字段名：${Object.keys(raw[0]).join(' | ')}`);
+      for (const [i, r] of raw.entries()) {
+        const why = diagnoseRow(r);
+        out.push(`  [${i}] ${why ? '❌ 丢弃 — ' + why : '✅ 解析成功 — ' + JSON.stringify(normalizeRow(r))}`);
+      }
       const norm = raw.map(normalizeRow).filter(Boolean);
       out.push(`解析成功 : ${norm.length} 条 / ${raw.length} 条`);
-      if (norm.length) out.push(`解析样例 : ${JSON.stringify(norm[norm.length - 1])}`);
-      if (norm.length < raw.length) out.push(`⚠️ 有 ${raw.length - norm.length} 条因缺收盘价被丢弃`);
+      if (norm.length < raw.length) out.push(`⚠️ 有 ${raw.length - norm.length} 条被丢弃（原因见上）`);
+    } else {
+      out.push('');
+      out.push(`⚠️ 接口返回成功但数组是空的。完整返回如下：`);
+      out.push(JSON.stringify(body, null, 2).slice(0, 2000));
     }
     out.push('');
     out.push('✅ 接口可用。现在访问 /update 拉一次正式数据，然后打开 /history 看报表。');
