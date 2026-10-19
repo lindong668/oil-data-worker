@@ -40,8 +40,14 @@ const GOLD_MANUAL_MAX_PER_DAY = 1;
 const SHOWAPI_HISTORY_URL = 'https://route.showapi.com/1108-2';
 /** 本站只做布伦特，禁止改成 wti —— 改了报表数据就全错 */
 const HISTORY_CODE_BRENT = 'blt';
-/** 每次拉取的窗口天数（1 次调用返回整段，不是一天一次请求） */
-const HISTORY_FETCH_DAYS = 60;
+/**
+ * 单次请求的窗口天数。
+ * ⚠️ 实测：7 天窗口能返回数据，60 天窗口返回 0 条 —— 该接口对区间长度有限制，
+ *    窗口开太大反而一条都不给。所以固定用小窗口，靠「分段回溯」补历史。
+ */
+const HISTORY_FETCH_DAYS = 7;
+/** 每次 /update 往前回溯几段（1 段 = 1 次请求 = 1 次额度）。日常保持 1 最省。 */
+const HISTORY_BACKFILL_SEGMENTS = 1;
 /** KV 最多保留的历史条数（约 1 年交易日） */
 const HISTORY_MAX_ROWS = 400;
 
@@ -352,7 +358,16 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
     // ---------------- /test-history 自测诊断 ----------------
     if (url.pathname === '/test-history') {
       const force = url.searchParams.get('force') === '1';
-      const r = await probeHistory(env, { force });
+      // ?probe=1 → 区间探测（测 7/14/30/60 天各返回几条，会消耗 4 次额度）
+      const probe = url.searchParams.get('probe') === '1';
+      // ?backfill=N → 分段回溯补历史（N 段 × 7 天，消耗 N 次额度，不受每日闸门限制）
+      const backfill = parseInt(url.searchParams.get('backfill') || '0', 10);
+      let r;
+      if (backfill > 0) {
+        r = await runBackfill(env, backfill);
+      } else {
+        r = await probeHistory(env, { force, probe });
+      }
       return new Response(r, { headers: TEXT_HEADERS });
     }
 
@@ -744,7 +759,37 @@ function diagnoseRow(r) {
   return null;   // 解析正常
 }
 
-async function fetchBrentHistory(env, { manual = false, days = HISTORY_FETCH_DAYS } = {}) {
+/** 请求一个窗口（begin~end），返回解析后的行数组 */
+async function fetchHistoryWindow(env, appKey, beginDate, endDate) {
+  const qs = new URLSearchParams({
+    appKey,
+    code: HISTORY_CODE_BRENT,
+    begin: ymd(beginDate),
+    end: ymd(endDate),
+  });
+  const res = await fetch(`${SHOWAPI_HISTORY_URL}?${qs.toString()}`, {
+    headers: { 'Accept': 'application/json' },
+    cf: { cacheTtl: 0 },
+  });
+  if (!res.ok) throw new Error(`ShowAPI 1108-2 HTTP ${res.status}`);
+
+  const json = await res.json();
+  if (json.showapi_res_code !== 0) {
+    throw new Error(`ShowAPI 网关错误 ${json.showapi_res_code}: ${json.showapi_res_error || '（多半是 1108 未开通）'}`);
+  }
+  const body = json.showapi_res_body || {};
+  if (body.ret_code !== 0) {
+    throw new Error(`ShowAPI 1108-2 ret_code=${body.ret_code} ${body.ret_message || body.remark || '（多半是 1108 未开通）'}`);
+  }
+  let raw = body.list || body.data || body.dataList || body.result || body.rows || [];
+  if (!Array.isArray(raw)) {
+    for (const v of Object.values(body)) { if (Array.isArray(v)) { raw = v; break; } }
+  }
+  if (!Array.isArray(raw)) raw = [];
+  return raw.map(normalizeRow).filter(Boolean);
+}
+
+async function fetchBrentHistory(env, { manual = false, days = HISTORY_FETCH_DAYS, segments = HISTORY_BACKFILL_SEGMENTS } = {}) {
   const cached = await env.OIL_KV.get('brent_history', 'json').catch(() => null);
 
   // 每日闸门：手动刷新时，今天已成功抓过就跳过（0 消耗）
@@ -763,41 +808,27 @@ async function fetchBrentHistory(env, { manual = false, days = HISTORY_FETCH_DAY
     throw new Error('HISTORY_CODE 被改成了非布伦特品种，已阻止');
   }
 
-  const end = new Date();
-  const begin = new Date(end.getTime() - days * 86400 * 1000);
-  const qs = new URLSearchParams({
-    appKey,
-    code: HISTORY_CODE_BRENT,
-    begin: ymd(begin),
-    end: ymd(end),
-  });
-
-  const res = await fetch(`${SHOWAPI_HISTORY_URL}?${qs.toString()}`, {
-    headers: { 'Accept': 'application/json' },
-    cf: { cacheTtl: 0 },
-  });
-  if (!res.ok) throw new Error(`ShowAPI 1108-2 HTTP ${res.status}`);
-
-  const json = await res.json();
-  if (json.showapi_res_code !== 0) {
-    throw new Error(`ShowAPI 网关错误 ${json.showapi_res_code}: ${json.showapi_res_error || '（多半是 1108 未开通，请到后台免费订购）'}`);
+  // 分段回溯：第 0 段 = 最近 days 天，第 1 段 = 再往前 days 天……
+  // 每段 1 次请求 = 1 次额度。日常 segments=1（只补最近一周，够用且最省）。
+  const all = [];
+  const segLog = [];
+  for (let s = 0; s < segments; s++) {
+    const end = new Date(Date.now() - s * days * 86400 * 1000);
+    const begin = new Date(end.getTime() - days * 86400 * 1000);
+    try {
+      const got = await fetchHistoryWindow(env, appKey, begin, end);
+      segLog.push(`${ymd(begin)}~${ymd(end)}: ${got.length}条`);
+      all.push(...got);
+    } catch (e) {
+      segLog.push(`${ymd(begin)}~${ymd(end)}: 失败(${e.message})`);
+      break;   // 某段失败就停，不再往后白烧额度
+    }
   }
-  const body = json.showapi_res_body || {};
-  if (body.ret_code !== 0) {
-    throw new Error(`ShowAPI 1108-2 ret_code=${body.ret_code} ${body.ret_message || body.remark || '（多半是 1108 未开通，请到后台免费订购）'}`);
-  }
-
-  let raw = body.list || body.data || body.dataList || body.result || body.rows || [];
-  if (!Array.isArray(raw)) {
-    for (const v of Object.values(body)) { if (Array.isArray(v)) { raw = v; break; } }
-  }
-  if (!Array.isArray(raw)) raw = [];
-  const fetched = raw.map(normalizeRow).filter(Boolean);
 
   // 与已有数据按 day 去重合并（新数据覆盖旧数据），按日期升序
   const map = new Map();
   for (const r of (cached?.rows || [])) map.set(r.day, r);
-  for (const r of fetched) map.set(r.day, r);
+  for (const r of all) map.set(r.day, r);
   const rows = [...map.values()]
     .sort((a, b) => (a.day < b.day ? -1 : a.day > b.day ? 1 : 0))
     .slice(-HISTORY_MAX_ROWS);
@@ -805,8 +836,9 @@ async function fetchBrentHistory(env, { manual = false, days = HISTORY_FETCH_DAY
   const data = {
     code: HISTORY_CODE_BRENT,
     label: '布伦特原油',
-    range: { begin: ymd(begin), end: ymd(end) },
-    fetchedCount: fetched.length,
+    range: { begin: ymd(new Date(Date.now() - segments * days * 86400 * 1000)), end: ymd(new Date()) },
+    fetchedCount: all.length,
+    segments: segLog,
     rows,
     updatedLocal: beijingNow(),
   };
@@ -903,7 +935,8 @@ async function renderHistoryPage(env) {
 }
 
 // ---------------- 自测诊断 ----------------
-async function probeHistory(env, { force = false } = {}) {
+async function probeHistory(env, { force = false, probe = false } = {}) {
+  if (probe) return runProbe(env);
   const appKey = env.SHOWAPI_APPKEY;
   const out = [];
   out.push(`=== 万维易源 1108-2 自测 ===`);
@@ -985,6 +1018,63 @@ async function probeHistory(env, { force = false } = {}) {
   } catch (e) {
     out.push('');
     out.push(`❌ 请求异常 : ${e.message}`);
+  }
+  return out.join('\n');
+}
+
+// ---------------- 区间探测：找出该接口能返回数据的最大窗口 ----------------
+// 访问 /test-history?probe=1（消耗 4 次额度）
+async function runProbe(env) {
+  const appKey = env.SHOWAPI_APPKEY;
+  const out = [];
+  out.push('=== 区间探测：多大窗口能返回数据 ===');
+  out.push(`北京时间 : ${beijingNow()}`);
+  if (!appKey) { out.push('❌ 未配置 SHOWAPI_APPKEY'); return out.join('\n'); }
+  out.push('（下面每项都是 1 次真实请求，共 4 次额度）');
+  out.push('');
+  for (const d of [7, 14, 30, 60]) {
+    const end = new Date();
+    const begin = new Date(end.getTime() - d * 86400 * 1000);
+    try {
+      const got = await fetchHistoryWindow(env, appKey, begin, end);
+      out.push(`  窗口 ${String(d).padStart(2)} 天 (${ymd(begin)}~${ymd(end)}) → 返回 ${got.length} 条 ${got.length ? '✅' : '❌ 空'}`);
+      if (got.length) out.push(`       样例：${JSON.stringify(got[got.length - 1])}`);
+    } catch (e) {
+      out.push(`  窗口 ${String(d).padStart(2)} 天 → 请求失败：${e.message}`);
+    }
+  }
+  out.push('');
+  out.push('结论：取「返回条数最多」的那个窗口填进 HISTORY_FETCH_DAYS。');
+  return out.join('\n');
+}
+
+// ---------------- 分段回溯：一次性补历史 ----------------
+// 访问 /test-history?backfill=N （N 段 × 7 天，消耗 N 次额度，不受每日闸门限制）
+async function runBackfill(env, segments) {
+  const out = [];
+  const N = Math.min(Math.max(segments, 1), 52);   // 最多 52 段 ≈ 一年
+  out.push(`=== 分段回溯补历史：${N} 段 × ${HISTORY_FETCH_DAYS} 天 ===`);
+  out.push(`预计消耗 ${N} 次额度，覆盖约 ${N * HISTORY_FETCH_DAYS} 天`);
+  out.push('');
+  try {
+    const before = await env.OIL_KV.get('brent_history', 'json').catch(() => null);
+    const beforeCount = before?.rows?.length ?? 0;
+    const { data } = await fetchBrentHistory(env, { manual: false, segments: N });
+    out.push(`抓取前 : ${beforeCount} 条`);
+    out.push(`抓取后 : ${data.rows.length} 条  （本次新增 ${data.rows.length - beforeCount} 条）`);
+    out.push('');
+    out.push('--- 各段结果 ---');
+    for (const s of (data.segments || [])) out.push(`  ${s}`);
+    out.push('');
+    if (data.rows.length) {
+      out.push(`日期范围 : ${data.rows[0].day} ~ ${data.rows[data.rows.length - 1].day}`);
+      out.push(`最新 5 条：`);
+      for (const r of data.rows.slice(-5)) out.push(`  ${JSON.stringify(r)}`);
+    }
+    out.push('');
+    out.push(`✅ 完成。现在打开 /history 看报表。`);
+  } catch (e) {
+    out.push(`❌ 失败：${e.message}`);
   }
   return out.join('\n');
 }
