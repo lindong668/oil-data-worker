@@ -32,6 +32,93 @@ function beijingNow() {
   return new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
 }
 
+/** 北京时间小时数（0-23），用于 cron 内部分支判断 */
+function beijingHour(d = new Date()) {
+  try {
+    return +new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false,
+    }).format(d);
+  } catch (e) {
+    return new Date(d.getTime() + 8 * 3600 * 1000).getUTCHours();
+  }
+}
+
+/** 伦敦本地时间 HH:MM（仅用于日志，方便你核对闸门行为） */
+function londonClock(d = new Date()) {
+  try {
+    return new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Europe/London', weekday: 'short',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    }).format(d);
+  } catch (e) {
+    return 'n/a';
+  }
+}
+
+/** 解析伦敦本地时间 → { wd: 0=周日..6=周六, hour: 0-23 } */
+function londonParts(d = new Date()) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Europe/London', weekday: 'short', hour: '2-digit', hour12: false,
+    }).formatToParts(d);
+    const get = t => (parts.find(p => p.type === t) || {}).value || '';
+    const wd = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].indexOf(get('weekday').toLowerCase());
+    const hour = parseInt(get('hour'), 10);
+    if (wd >= 0 && !isNaN(hour)) return { wd, hour };
+  } catch (e) { /* fall through */ }
+  // 兜底：手动换算（粗略，极少触发）
+  const lon = new Date(d.getTime() + (d.getUTCMonth() > 9 || (d.getUTCMonth() === 9 && d.getUTCDate() >= 25) ? 0 : 1) * 3600 * 1000);
+  return { wd: lon.getUTCDay(), hour: lon.getUTCHours() };
+}
+
+// ============================================================
+// 布伦特原油交易时段闸门（省 API 配额的关键）
+// ------------------------------------------------------------
+// 以「伦敦本地时间」判断，而不是写死北京时间 —— 这样英国在
+// 10 月底切换冬令时（BST -> GMT）时会自动跟随，不需要改代码。
+//
+//  伦敦时间            北京时间(夏令时/冬令时)
+//  周日 01:00 开盘     周日 08:00 / 09:00
+//  周一~周五 01:00-23:00 交易
+//  每天 23:00 休市      06:00 / 07:00（次日）
+//  周五 23:00 收盘     周六 06:00 / 07:00
+//  周六 全天休市       约 26 小时完全不动
+//
+// 周末那段是最大的浪费源：不加这道闸门，cron 会在休市的 26 小时里
+// 傻傻地抓 26 次，每次都拿到同一个休市价。
+// ============================================================
+function isBrentTrading(d = new Date()) {
+  const { wd, hour } = londonParts(d);
+  if (wd === 6) return false;               // 周六 全天休市
+  if (wd === 5 && hour >= 23) return false; // 周五 23:00 收盘
+  if (wd === 0 && hour < 1) return false;   // 周日 01:00 才开盘
+  if (hour >= 23 || hour < 1) return false; // 每日结算休市 23:00-01:00
+  return true;
+}
+
+// ============================================================
+// 收盘补抓窗口（★ 本次新增，最重要的一条）
+// ------------------------------------------------------------
+// 问题：市场 23:00 休市，但如果最后一次抓取卡在 22:00（休市前 1 小时），
+//       拿到的就不是当日最终价，之后又不再抓 —— 当天价格就定错在半路上。
+//
+// 解决：休市后「再抓一次」，把当日最终价钉死。
+//   · 伦敦 00:00 = 休市后 1 小时   → 补抓（本次新增）
+//   · 伦敦 01:00 = 休市后 2 小时   → 新交易日开盘，交易时段本来就会抓
+//   两个点都覆盖到，确保休市后 1~2 小时内必定有一次抓取。
+//
+//  周二~周五 00:00 → 拿到「前一交易日当日收盘价」
+//  周六     00:00 → 拿到「周五周收盘价」★ 整个周末都显示它，最关键
+//  周日     00:00 → 跳过（01:00 才开盘，此时抓到的仍是沿用值，浪费）
+//
+// 夏令时：伦敦 00:00 = 北京 07:00；冬令时：伦敦 00:00 = 北京 08:00
+// ============================================================
+function isClosingWindow(d = new Date()) {
+  const { wd, hour } = londonParts(d);
+  if (wd === 0) return false;   // 周日开盘前不补抓
+  return hour === 0;            // 休市后 1 小时
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -64,12 +151,12 @@ export default {
       const cnUTC = cn?.updatedAt || '';
       const displayUTC = oilAsOf || oilUTC || goldUTC || cnUTC;
 
-      // 原油标签：先看 stale，再看是否定时任务抓的
+      // 原油标签：先看 stale，再区分「收盘价」与「盘中价」
       const oilTag = o?.stale === true
-        ? '📅 每日参考价（源数据未刷新，沿用上一交易日收盘）'
-        : (o?.isSettlement
-          ? '✅ 每日参考价（凌晨 04:00 自动抓取，结算参考）'
-          : '⚡ 盘中参考价（手动刷新，源数据已更新）');
+        ? '📅 休市沿用价（源数据未刷新，沿用上一交易日收盘）'
+        : (o?.isClosing
+          ? '🔒 当日收盘价（休市后 1 小时抓取，已定格）'
+          : '⚡ 盘中参考价（交易时段每小时更新）');
 
       const oilFresh = o?.stale === true
         ? '<span style="color:#c0392b">沿用值 stale=true</span>'
@@ -163,8 +250,17 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
         env.OIL_KV.get('cn_oil_data', 'json'),
         env.OIL_KV.get('gold_fetch_marker', 'json'),
       ]);
+      const now = new Date();
       return new Response(JSON.stringify({
         todayBeijing: beijingDateString(),
+        // 闸门状态：方便你核对「该抓的时候到底抓没抓」
+        tradingWindow: {
+          beijingHour: beijingHour(now),
+          londonClock: londonClock(now),
+          brentTrading: isBrentTrading(now),
+          closingWindow: isClosingWindow(now),
+          note: 'brentTrading=false 且 closingWindow=false 时 cron 跳过抓取（休市）；手动 /update 不受影响',
+        },
         oil,
         gold,
         cn_oil: cn,
@@ -245,19 +341,35 @@ ${cnDetail}
 
   // ---------------- Cron ----------------
   async scheduled(controller, env) {
-    const cron = (controller.cron || '').trim();
-    if (cron === '0 20 * * *') {
-      // 北京时间 04:00（UTC 20:00）→ 原油 + 黄金（黄金定时任务无条件抓取）
-      await Promise.allSettled([fetchAndSave(env, true), fetchGoldAndSave(env, { manual: false })]);
-    } else if (cron === '0 0 * * *') {
-      // 北京时间 08:00（UTC 00:00）→ 国内油价
-      await Promise.allSettled([fetchCnOilAll(env)]);
+    const now = new Date();
+    const h = beijingHour(now);   // 北京时间小时（cron 整点触发，必为整数）
+    const jobs = [];
+
+    // 黄金：每天 04:00 一次。月度配额极珍贵，盘中绝不抓。
+    if (h === 4) jobs.push(fetchGoldAndSave(env, { manual: false }));
+
+    // 国内油价：每天 08:00 一次（万维易源 7-8 点更新后再拉）
+    if (h === 8) jobs.push(fetchCnOilAll(env));
+
+    // 原油：交易时段每小时抓 + 休市后 1 小时补抓一次（钉死当日最终价）
+    const trading = isBrentTrading(now);
+    const closing = isClosingWindow(now);
+
+    if (trading || closing) {
+      jobs.push(fetchAndSave(env, closing));   // closing=true → 标记为「当日收盘价」
+      console.log(`[cron] 原油抓取 — 北京 ${h}:00，伦敦 ${londonClock(now)}，${closing ? '收盘补抓' : '盘中'}`);
+    } else {
+      console.log(`[cron] 布伦特休市，跳过 — 北京 ${h}:00，伦敦 ${londonClock(now)}`);
     }
+
+    if (!jobs.length) return;
+    await Promise.allSettled(jobs);
   }
 };
 
 // ================= 原油 =================
-async function fetchAndSave(env, isScheduled) {
+// isClosing = true 表示这次是「休市后 1 小时」的收盘补抓，抓到的是当日最终价
+async function fetchAndSave(env, isClosing = false) {
   const apiKey = env.OILPRICEAPI_KEY;
   if (!apiKey) throw new Error('Missing OILPRICEAPI_KEY');
 
@@ -282,7 +394,8 @@ async function fetchAndSave(env, isScheduled) {
     asOf,                                             // 源观测时间
     stale,                                            // true = 沿用值
     updatedLocal: beijingNow(),
-    isSettlement: !!isScheduled,
+    isClosing: !!isClosing,                 // true = 当日收盘价（休市后 1 小时抓取）
+    isSettlement: !!isClosing,              // 兼容旧字段，含义同上
     prevPrice: prev && prev.price != null ? prev.price : null,
     changed: prev ? String(prev.price) !== String(p.price) : null,
   };
