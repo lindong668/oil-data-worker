@@ -1,4 +1,4 @@
-# wrangler.toml
+# wrangler.toml  —  oil-data-worker  v2
 name = 'oil-data-worker'
 main = "src/index.js"
 compatibility_date = "2024-01-01"
@@ -14,3 +14,23 @@ crons = [
   "0 20 * * *",   # 北京时间 04:00（UTC 20:00）→ 原油 + 黄金
   "0 0 * * *"     # 北京时间 08:00（UTC 00:00）→ 国内油价（万维易源 7-8 点更新后拉取）
 ]
+
+# -------------------------------------------------------------------
+# ⚠️ 以下密钥请勿写进本文件（会随仓库泄露）。
+#    请在 Cloudflare Dashboard → Workers → oil-data-worker
+#    → Settings → Variables and Secrets → Add 逐个添加（类型选 Secret）：
+#
+#      OILPRICEAPI_KEY     布伦特原油 API Token
+#      METALPRICEAPI_KEY   黄金 API Key
+#      SHOWAPI_APPKEY      万维易源 138-46 AppKey
+#
+#    本地开发用 .dev.vars（记得加进 .gitignore）：
+#      OILPRICEAPI_KEY="xxxx"
+#      METALPRICEAPI_KEY="xxxx"
+#      SHOWAPI_APPKEY="xxxx"
+# -------------------------------------------------------------------
+# 配额提醒：
+#   · OilPriceAPI：新账号 7 天试用 10,000 次，之后自动降为 50 次/天
+#   · MetalpriceAPI 免费档：约 100 次/月 → 代码已加「每日闸门」，
+#     定时任务每天 1 次；手动刷新当天已抓过则跳过，每天最多补抓 1 次
+# -------------------------------------------------------------------
