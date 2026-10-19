@@ -37,6 +37,23 @@ const TEXT_HEADERS = { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Contr
 const GOLD_MANUAL_MAX_PER_DAY = 1;
 
 // ============================================================
+// 原油：一次请求拿两个品种（官方支持，20 个 code 也算 1 次配额）
+// ------------------------------------------------------------
+// 官方文档：by_code=A,B 时「One request, ONE against quota — up to 20 codes」
+//   · 1 个 code   → data 是扁平对象，读 data.price
+//   · 2 个及以上  → data.prices[] 是数组
+// 所以解析必须两种结构都兼容（见 pickQuote）。
+//
+// 安全设计（重要）：批量请求一旦失败/拿不到布伦特，
+// 自动降级为「只请求 BRENT_CRUDE_USD」（即改动前的原样请求），
+// 保证布伦特永远不受 WTI 影响 —— WTI 只是白捡的，主流程零风险。
+// ============================================================
+const OIL_CODES = 'BRENT_CRUDE_USD,WTI_USD';
+const BRENT_CODE = 'BRENT_CRUDE_USD';
+const WTI_CODE = 'WTI_USD';
+const OIL_LATEST_BASE = 'https://api.oilpriceapi.com/v1/prices/latest';
+
+// ============================================================
 // 布伦特历史走势 —— 自建累积（已移除万维易源 ShowAPI 1108-2）
 // ------------------------------------------------------------
 // 为什么不再用 1108-2：
@@ -221,10 +238,11 @@ export default {
 
     // ---------------- 首页 ----------------
     if (url.pathname === '/') {
-      const [oilCached, goldCached, cnCached] = await Promise.all([
+      const [oilCached, goldCached, cnCached, wtiCached] = await Promise.all([
         env.OIL_KV.get('oil_data', 'json'),
         env.OIL_KV.get('gold_data', 'json'),
         env.OIL_KV.get('cn_oil_data', 'json'),
+        env.OIL_KV.get('wti_data', 'json'),
       ]);
 
       // 首屏只读缓存，绝不触发抓取（省配额）
@@ -284,6 +302,18 @@ ${o ? `
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">本次抓取时刻</td><td style="padding:8px 0">${o.updatedLocal || '—'} <span style="font-size:12px;color:#999">(北京时间)</span></td></tr>
 </table>` : ''}
 
+${wtiCached && wtiCached.price != null ? `
+<h2 style="margin-top:32px">🛢️ WTI 原油</h2>
+<p><strong>⚡ 与布伦特同一次请求带回（不额外消耗配额）</strong></p>
+<table style="width:100%;border-collapse:collapse;margin:20px 0">
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">每桶价格</td><td style="padding:8px 0">$${wtiCached.price} USD</td></tr>
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">每升价格</td><td style="padding:8px 0">$${(parseFloat(wtiCached.price) / 158.987).toFixed(4)} USD</td></tr>
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">数据新鲜度</td><td style="padding:8px 0">${wtiCached.stale === true ? '<span style="color:#c0392b">沿用值 stale=true</span>' : '<span style="color:#27ae60">新值 stale=false</span>'}</td></tr>
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">源观测时间 as_of</td><td style="padding:8px 0">${wtiCached.asOf ? new Date(wtiCached.asOf).toISOString() : '—'} <span style="font-size:12px;color:#999">(UTC)</span></td></tr>
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">上次价格 / 是否变化</td><td style="padding:8px 0">${wtiCached.prevPrice ?? '—'} / ${wtiCached.changed === null ? '—' : (wtiCached.changed ? '有变化' : '无变化')}</td></tr>
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">本次抓取时刻</td><td style="padding:8px 0">${wtiCached.updatedLocal || '—'} <span style="font-size:12px;color:#999">(北京时间)</span></td></tr>
+</table>` : ''}
+
 ${g ? `
 <h2 style="margin-top:32px">🪙 国际黄金（XAU/USD）</h2>
 <p><strong>📅 每日参考价（延迟日更，非盘中实时）</strong></p>
@@ -340,13 +370,14 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
 
     // ---------------- /data ----------------
     if (url.pathname === '/data') {
-      const [oil, gold, cn, marker, hist, cnMarker] = await Promise.all([
+      const [oil, gold, cn, marker, hist, cnMarker, wti] = await Promise.all([
         env.OIL_KV.get('oil_data', 'json'),
         env.OIL_KV.get('gold_data', 'json'),
         env.OIL_KV.get('cn_oil_data', 'json'),
         env.OIL_KV.get('gold_fetch_marker', 'json'),
         env.OIL_KV.get('brent_history', 'json'),
         env.OIL_KV.get('cn_oil_fetch_marker', 'json'),
+        env.OIL_KV.get('wti_data', 'json'),
       ]);
       const now = new Date();
       return new Response(JSON.stringify({
@@ -360,6 +391,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
           note: 'brentTrading=false 且 closingWindow=false 时 cron 跳过抓取（休市）；手动 /update 不受影响',
         },
         oil,
+        wti: wti || null,          // WTI 原油（同一次请求带回，不额外消耗配额）
         gold,
         cn_oil: cn,
         goldFetchMarker: marker || null,
@@ -419,6 +451,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
       };
 
       const oilR = results[0], goldR = results[1], cnR = results[2];
+      const wtiD = (oilR.status === 'fulfilled' && oilR.value && oilR.value.wti) ? oilR.value.wti : null;
 
       // 原油详情
       let oilDetail = '';
@@ -428,7 +461,9 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
     stale     : ${d.stale}  ${d.stale ? '（沿用值：源未刷新，不是代码没抓）' : '（新值）'}
     源观测时间 : ${d.asOf || '—'}
     收集时间   : ${d.timestamp || '—'}
-    抓取时刻   : ${d.updatedLocal}`;
+    抓取时刻   : ${d.updatedLocal}
+    请求模式   : ${d.sourceMode === 'batch' ? 'batch（布伦特+WTI 一次带回，计 1 次配额）' : 'single（降级，只请求布伦特）'}
+    WTI 原油   : ${wtiD ? `$${wtiD.price}（上次 $${wtiD.prevPrice ?? '—'}，${wtiD.changed === null ? '—' : (wtiD.changed ? '有变化' : '无变化')}）` : '本次未返回（不影响布伦特，下次自动重试）'}`;
       } else if (oilR.status === 'rejected') {
         oilDetail = `    原因 : ${oilR.reason?.message || oilR.reason}`;
       }
@@ -528,14 +563,9 @@ async function fetchAndSave(env, isClosing = false) {
 
   const prev = await env.OIL_KV.get('oil_data', 'json').catch(() => null);
 
-  const res = await fetch('https://api.oilpriceapi.com/v1/prices/latest?by_code=BRENT_CRUDE_USD', {
-    headers: { 'Authorization': `Token ${apiKey}` },
-    cf: { cacheTtl: 0 },
-  });
-  if (!res.ok) throw new Error(`Oil API ${res.status}`);
-
-  const json = await res.json();
-  const p = (json && json.data) || {};
+  // 一次请求拿布伦特 + WTI；拿不到批量就自动降级只请求布伦特（见 fetchOilJson）
+  const { json, mode } = await fetchOilJson(apiKey);
+  const p = pickQuote(json, BRENT_CODE) || ((json && json.data) || {});
 
   const stale = p.stale === true || json.stale === true;
   const asOf = p.as_of || p.as_of_at || p.created_at || p.timestamp || null;
@@ -551,14 +581,121 @@ async function fetchAndSave(env, isClosing = false) {
     isSettlement: !!isClosing,              // 兼容旧字段，含义同上
     prevPrice: prev && prev.price != null ? prev.price : null,
     changed: prev ? String(prev.price) !== String(p.price) : null,
+    sourceMode: mode,                       // 'batch' = 一次拿两个；'single' = 降级只拿布伦特
   };
 
   await env.OIL_KV.put('oil_data', JSON.stringify(result), { expirationTtl: 86400 * 2 });
 
+  // WTI：白捡的第二个品种，同一次请求里带回来的，不额外消耗配额。
+  // 拿不到就跳过，绝不影响布伦特（主流程已存完）。
+  let wti = null;
+  // 只在批量模式里找 WTI：降级模式压根没请求 WTI，不该有数据。
+  // 双保险 —— 即使 pickQuote 兜底逻辑将来有变动，也不会把布伦特当 WTI 存进去。
+  const w = mode === 'batch' ? pickQuote(json, WTI_CODE) : null;
+  if (w && w.price != null) {
+    const prevW = await env.OIL_KV.get('wti_data', 'json').catch(() => null);
+    wti = {
+      code: WTI_CODE,
+      name: 'WTI 原油',
+      price: w.price,
+      formatted: w.formatted || `$${w.price}`,
+      timestamp: w.created_at || w.timestamp || null,
+      asOf: w.as_of || w.as_of_at || w.created_at || w.timestamp || null,
+      stale: w.stale === true,
+      updatedLocal: beijingNow(),
+      isClosing: !!isClosing,
+      prevPrice: prevW && prevW.price != null ? prevW.price : null,
+      changed: prevW ? String(prevW.price) !== String(w.price) : null,
+      sourceMode: mode,
+    };
+    await env.OIL_KV.put('wti_data', JSON.stringify(wti), { expirationTtl: 86400 * 2 });
+  }
+
   // 顺手把本次价格记进历史走势（自建累积，零额外额度）
   await recordDailyHistory(env, { price: result.price, isClosing: !!isClosing }).catch(() => {});
 
-  return { data: result, prev, skipped: false };
+  return { data: result, wti, prev, skipped: false };
+}
+
+// ------------------------------------------------------------
+// 取原油报价：优先批量（1 次配额拿 2 个品种），失败自动降级
+// ------------------------------------------------------------
+async function fetchOilJson(apiKey) {
+  const headers = { 'Authorization': `Token ${apiKey}` };
+
+  // ① 批量：BRENT_CRUDE_USD + WTI_USD
+  try {
+    const res = await fetch(`${OIL_LATEST_BASE}?by_code=${OIL_CODES}`, {
+      headers, cf: { cacheTtl: 0 },
+    });
+    if (res.ok) {
+      const json = await res.json();
+      // 只有真的解析出布伦特才算成功，否则降级
+      if (pickQuote(json, BRENT_CODE)) return { json, mode: 'batch' };
+      console.log('[oil] 批量响应未含布伦特，降级为单品种请求');
+    } else {
+      console.log(`[oil] 批量请求 ${res.status}，降级为单品种请求`);
+    }
+  } catch (e) {
+    console.log(`[oil] 批量请求异常（${e.message}），降级为单品种请求`);
+  }
+
+  // ② 降级：只请求布伦特 —— 与改动前的请求完全一致，保证主流程不受影响
+  const res2 = await fetch(`${OIL_LATEST_BASE}?by_code=${BRENT_CODE}`, {
+    headers, cf: { cacheTtl: 0 },
+  });
+  if (!res2.ok) throw new Error(`Oil API ${res2.status}`);
+  return { json: await res2.json(), mode: 'single' };
+}
+
+/** 归一化品种代码，用于比对（忽略大小写与下划线） */
+function normalizeCode(c) {
+  return String(c == null ? '' : c).toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+// ------------------------------------------------------------
+// 从响应里挑出指定品种 —— 兼容「扁平对象」与「数组」两种结构
+//   · 1 个 code  → data 是扁平对象
+//   · 2 个及以上 → data.prices[] 是数组
+// 文档：A single code returns a flat data object; two or more return data.prices[]
+// ------------------------------------------------------------
+function pickQuote(json, code) {
+  const d = json && json.data;
+  if (!d) return null;
+  const want = normalizeCode(code);
+  const hit = (o) => {
+    if (!o || typeof o !== 'object') return false;
+    return normalizeCode(o.code) === want
+        || normalizeCode(o.commodity) === want
+        || normalizeCode(o.symbol) === want;
+  };
+
+  // 数组结构：data.prices[] / data.data[] / data 本身是数组
+  const list = Array.isArray(d.prices) ? d.prices
+             : Array.isArray(d.data)   ? d.data
+             : Array.isArray(d)        ? d
+             : null;
+  if (list) {
+    for (const it of list) if (hit(it)) return it;
+    // 兜底：只返回一个品种，且该元素完全没带 code 字段时才认。
+    // 带了 code 却没匹配上 → 必须 null。否则「批量响应里只有别的品种」
+    // 会被误当成布伦特（实测曾把天然气 3.2 存成布伦特），直接污染主数据。
+    const only = list.length === 1 ? list[0] : null;
+    if (only && only.price != null
+        && only.code == null && only.commodity == null && only.symbol == null) {
+      return only;
+    }
+    return null;
+  }
+
+  // 扁平结构
+  if (hit(d)) return d;
+  // 兜底：单品种响应可能完全不带 code 字段。
+  // 但只要带了 code 且没匹配上，就必须返回 null ——
+  // 否则降级时（只请求了布伦特）会把布伦特当成 WTI 返回，造成价格错配。
+  const hasCode = d.code != null || d.commodity != null || d.symbol != null;
+  if (!hasCode && d.price != null) return d;
+  return null;
 }
 
 /** 该日期（YYYY-MM-DD）在伦敦是不是周一~周五（有交易的日子） */
