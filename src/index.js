@@ -29,9 +29,12 @@
  * ---------------------------------------------------------------
  */
 
-const HTML_HEADERS = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' };
-const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' };
-const TEXT_HEADERS = { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' };
+/* X-Robots-Tag：本站是私有数据后端，所有响应一律禁止搜索引擎收录，
+ * 避免内部管理页（/ /history /update）被 Google 索引后公开暴露。 */
+const NOINDEX = 'noindex, nofollow, noarchive, noimageindex';
+const HTML_HEADERS = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Robots-Tag': NOINDEX };
+const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Robots-Tag': NOINDEX };
+const TEXT_HEADERS = { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'X-Robots-Tag': NOINDEX };
 
 /** 黄金手动刷新每日上限（保护月度配额，1 = 每天最多手动抓 1 次） */
 const GOLD_MANUAL_MAX_PER_DAY = 1;
@@ -251,9 +254,92 @@ async function markDailyFetched(env, markerKey, source) {
   );
 }
 
+/* ============ 私有后端访问控制（v7） ============
+ *
+ * 背景：本站是 2 号 PriceScope 的专属数据后端，本不该对公网开放。
+ * 加防护前的三个风险（按严重程度排序）：
+ *
+ *   ① /update 任何人可触发真实抓取 ★最危险★
+ *      一次 /update 会同时打三家 API：
+ *        OilPriceAPI  50 次/天
+ *        Metalprice   100 次/月
+ *        万维易源      100 次/天
+ *      被脚本刷几次，当天配额就见底，2 号站全天取不到数据。
+ *
+ *   ② / 与 /history 会把内部数据管理页整个公开。
+ *
+ *   ③ 搜索引擎可能收录这些内部页。
+ *
+ * 策略：按危险程度分级
+ *   /update /clear-history → 无密钥直接 404（连"存在"都不暴露）
+ *   /data                  → 无密钥 403 JSON
+ *   / /history             → 无密钥返回极简占位页（无数据）
+ *   /robots.txt            → 公开返回 Disallow: /
+ *
+ * 密钥两种携带方式：
+ *   · 请求头 X-Access-Key   ← 2 号 Worker 服务端调用用这个
+ *   · 查询参数 ?key=        ← 你自己浏览器访问用这个（可存书签）
+ *
+ * ⚠️ 未配置 env.ACCESS_KEY 时防护自动关闭（放行），
+ *    防止密钥没配好导致 2 号站全线取不到数据。
+ */
+function hasAccess(request, env) {
+  const expected = env.ACCESS_KEY;
+  if (!expected) return true;
+  const h = request.headers.get('X-Access-Key');
+  if (h && h === expected) return true;
+  try {
+    const q = new URL(request.url).searchParams.get('key');
+    if (q && q === expected) return true;
+  } catch (_) {}
+  return false;
+}
+
+/* 未授权时的占位页：不含任何数据，也不含任何可探测的链接 */
+function lockedPage() {
+  return new Response(
+    '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<meta name="robots" content="noindex,nofollow">' +
+    '<title>403</title></head><body style="font-family:system-ui;display:flex;' +
+    'align-items:center;justify-content:center;height:100vh;margin:0;background:#0f172a;color:#94a3b8">' +
+    '<div style="text-align:center"><div style="font-size:48px;font-weight:600">403</div>' +
+    '<div style="margin-top:8px;font-size:14px">Forbidden</div></div></body></html>',
+    { status: 403, headers: HTML_HEADERS }
+  );
+}
+
+/* 无密钥访问受保护路由时返回 404 —— 不暴露这些路径真实存在 */
+function ghost() {
+  return new Response('Not Found', { status: 404, headers: { ...TEXT_HEADERS } });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+    const ok = hasAccess(request, env);
+
+    // robots.txt：公开返回，明确告诉搜索引擎不要抓
+    if (url.pathname === '/robots.txt') {
+      return new Response('User-agent: *\nDisallow: /\n', { headers: TEXT_HEADERS });
+    }
+
+    // ① 高危写操作：无密钥直接 404，不暴露路径存在
+    if ((url.pathname === '/update' || url.pathname === '/clear-history') && !ok) {
+      return ghost();
+    }
+
+    // ② 数据接口：无密钥 403
+    if (url.pathname === '/data' && !ok) {
+      return new Response(JSON.stringify({ error: 'forbidden' }), {
+        status: 403, headers: JSON_HEADERS,
+      });
+    }
+
+    // ③ 内部管理页：无密钥返回无数据占位页
+    if ((url.pathname === '/' || url.pathname === '/history') && !ok) {
+      return lockedPage();
+    }
 
     // ---------------- 首页 ----------------
     if (url.pathname === '/') {
