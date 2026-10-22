@@ -343,6 +343,8 @@ export default {
 
     // ---------------- 首页 ----------------
     if (url.pathname === '/') {
+      // 密钥透传：让首页底部所有链接继续可用（否则点了就 403）
+      const keyQS = url.searchParams.get('key') ? `?key=${encodeURIComponent(url.searchParams.get('key'))}` : '';
       const [oilCached, goldCached, cnCached, wtiCached] = await Promise.all([
         env.OIL_KV.get('oil_data', 'json'),
         env.OIL_KV.get('gold_data', 'json'),
@@ -357,7 +359,7 @@ export default {
       if (!cn) cn = await fetchCnOilAll(env);
 
       if (!o && !g && !(cn && cn.list && cn.list.length)) {
-        return new Response('<h1>暂无数据</h1><p><a href="/update">点击更新</a></p>', { headers: HTML_HEADERS });
+        return new Response('<h1>暂无数据</h1><p><a href="/update' + keyQS + '">点击更新</a></p>', { headers: HTML_HEADERS });
       }
 
       const pricePerBarrel = o ? parseFloat(o.price) : null;
@@ -449,7 +451,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
 
 <p style="font-size:14px;color:#666">🕐 你的本地时间：<span id="localTime"></span> <span style="font-size:12px;color:#999" id="tz"></span></p>
 <p style="font-size:12px;color:#aaa">以上为国际原料与成品油参考价，非零售汽油价 / 首饰金价。黄金为延迟日更参考价，不代表实时盘中报价。</p>
-<p style="font-size:12px;color:#aaa"><a href="https://metalpriceapi.com" target="_blank" rel="noopener">Data provided by MetalpriceAPI</a> · <a href="/update">手动刷新</a> · <a href="/history">📈 布伦特走势</a> · <a href="/history?code=wti">📈 WTI走势</a> · <a href="/data">原始JSON</a></p>
+<p style="font-size:12px;color:#aaa"><a href="https://metalpriceapi.com" target="_blank" rel="noopener">Data provided by MetalpriceAPI</a> · <a href="/update${keyQS}">手动刷新</a> · <a href="/history${keyQS}">📈 布伦特走势</a> · <a href="/history?code=wti${keyQS.replace('?', '&')}">📈 WTI走势</a> · <a href="/data${keyQS}">原始JSON</a></p>
 
 <script>
   var d = new Date('${displayUTC}');
@@ -524,7 +526,9 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
     // ---------------- /history 报表页 ----------------
     if (url.pathname === '/history') {
       const hKey = url.searchParams.get('code') === 'wti' ? 'wti' : 'brent';
-      return new Response(await renderHistoryPage(env, hKey), { headers: HTML_HEADERS });
+      // 把密钥透传进页面，让页内切换/返回链接继续可用
+      const keyQS = url.searchParams.get('key') ? `?key=${encodeURIComponent(url.searchParams.get('key'))}` : '';
+      return new Response(await renderHistoryPage(env, hKey, keyQS), { headers: HTML_HEADERS });
     }
 
     // ---------------- /clear-history 清空历史（自建累积，随时可重来）----------------
@@ -1049,16 +1053,18 @@ function toNum(v) {
   return Number.isFinite(n) ? n : null;
 }
 
-async function renderHistoryPage(env, hKey = 'brent') {
+async function renderHistoryPage(env, hKey = 'brent', keyQS = '') {
   const spec = historySpec(hKey);
   const hist = await env.OIL_KV.get(spec.kvKey, 'json').catch(() => null);
   const rows = hist?.rows || [];
   const L = spec.label;   // 标题里的品种名
 
   // 页面顶部切换品种的链接
+  // ★ keyQS 把访问密钥透传到页面内所有链接上，
+  //   否则开启访问控制后，点页面里的切换链接会直接 403。
   const switchLink = `<p style="font-size:13px">切换品种：`
-    + `<a href="/history">📈 ${HISTORY_SPECS.brent.label}</a> · `
-    + `<a href="/history?code=wti">📈 ${HISTORY_SPECS.wti.label}</a>`
+    + `<a href="/history${keyQS}">📈 ${HISTORY_SPECS.brent.label}</a> · `
+    + `<a href="/history?code=wti${keyQS.replace('?', '&')}">📈 ${HISTORY_SPECS.wti.label}</a>`
     + ` ｜ 当前：<b>${L}</b></p>`;
 
   if (!rows.length) {
@@ -1069,8 +1075,8 @@ ${switchLink}
 <p>暂无数据 —— 历史走势是<b>自建累积</b>的：每次 cron 抓取实时价时顺便记一条，
 每天一组开/高/低/收，日积月累形成走势。</p>
 <p>第一次抓取后就会出现第一条，之后每天自动增加。中间不会额外消耗 API 额度。</p>
-<p>操作：访问 <a href="/update">/update</a> 手动抓一次即可看到首条数据。</p>
-<p><a href="/">← 返回首页</a></p></body></html>`;
+<p>操作：访问 <a href="/update${keyQS}">/update</a> 手动抓一次即可看到首条数据。</p>
+<p><a href="/${keyQS}">← 返回首页</a></p></body></html>`;
   }
 
   const show = rows.slice(-60);   // 页面最多展示最近 60 条
@@ -1169,6 +1175,6 @@ ${thin ? `<p style="font-size:12px;color:#c0392b;margin-top:16px">
 （01:00–23:00）理论最多约 22 个点，真实日内高低点很可能落在两次采样之间，
 因此最高/最低仅供参考、不等于官方日内极值。收盘价为休市后补抓的当日最终观测价，
 定格后不再变动；涨跌幅按「收盘对收盘」计算，两端口径一致，相对最可信（美元/桶）。</p>
-<p><a href="/">← 返回首页</a> · <a href="/update">手动刷新</a> · <a href="/clear-history?code=${hKey}">清空${L}历史</a></p>
+<p><a href="/${keyQS}">← 返回首页</a> · <a href="/update${keyQS}">手动刷新</a> · <a href="/clear-history?code=${hKey}${keyQS.replace('?', '&')}">清空${L}历史</a></p>
 </body></html>`;
 }
