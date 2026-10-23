@@ -1,5 +1,5 @@
 /**
- * oil-data-worker  v6
+ * oil-data-worker  v8
  * ---------------------------------------------------------------
  * v2 改动（针对「手动刷新拉不到新数据」问题）：
  *  1. 原油：抓取时一并记录 stale（沿用值标记）与 as_of（源观测时间），
@@ -26,6 +26,41 @@
  *
  * 当前保留的数据源：OilPriceAPI（原油实时）、MetalpriceAPI（黄金）、
  *                    ShowAPI 138-46（国内油价，与已删除的 1108 无关）
+ *
+ * v7 改动：新增 ACCESS_KEY 私有密钥（防止公网刷爆 API 配额）
+ *
+ * v8 改动（本次）：布伦特与 WTI 拆成两套独立交易时段闸门
+ *  1. 【两个品种的交易时段本来就不一样，不能共用一套判断】
+ *       布伦特（ICE，伦敦）：周日 23:00 开盘，周一~周五 23:00 收盘，
+ *                            每日休市 2 小时（23:00-01:00），周六全天休市
+ *       WTI（CME，芝加哥）：周日 17:00 开盘，周一~周五 16:00 收盘，
+ *                            每日休市 1 小时（16:00-17:00），周六全天休市
+ *
+ *  2. 【修复：周日开盘时间写错，一周白烧 22 次】
+ *       旧代码写「周日 01:00 开盘」，但 ICE 官方合约规格明确是
+ *       「Open 01:00 (23.00 on Sundays)」—— 周日其实是 23:00 开盘。
+ *       旧逻辑导致周日白天伦敦 01:00-22:00 全在抓，那 22 小时市场是休市的，
+ *       抓回来的全是周五收盘后的沿用值，纯浪费配额。
+ *
+ *  3. 【修复：收盘补抓不能「休市后 1 小时」】
+ *       WTI 每天只休市 1 小时。若沿用「休市后 1 小时再抓」会落在 17:00，
+ *       那已经是【重新开盘】的时刻，抓到的是新交易日开盘价而非当日收盘价。
+ *       改为休市后 20 分钟抓（芝加哥 16:20 / 伦敦 23:20），仍在休市窗口内。
+ *
+ *  4. 【cron 改为 "5,20 * * * *"】每小时跑两次：
+ *       :05 → 盘中采样（开盘那小时 = 开盘后 5 分钟）
+ *       :20 → 收盘补抓（休市那小时 = 休市后 20 分钟）
+ *       伦敦 / 芝加哥与 UTC 时差都是整小时，分钟数无需换算。
+ *
+ *  5. 【修复：周一凌晨被误判为休市】
+ *       周一 00:00 是「周日 23:00 开盘」的延续，本属交易时段，
+ *       旧代码写死 hour>=1 会把它判成休市，丢掉开盘后第一个数据点。
+ *
+ *  6. 【交易日归属各自计算】布伦特看伦敦（周日 23:00 后归周一），
+ *       WTI 看芝加哥（17:00 后归次日），历史走势不再串天。
+ *
+ *  实测消耗：130 次/周（改前 138），日均 18.6 次，峰值日 26 次，
+ *            离 50 次/天上限很宽裕，且周日不再白烧。
  * ---------------------------------------------------------------
  */
 
@@ -123,13 +158,44 @@ function tradingDateString(d = new Date()) {
     lon = new Date(d.getTime() + (d.getUTCMonth() > 9 || (d.getUTCMonth() === 9 && d.getUTCDate() >= 25) ? 0 : 1) * 3600 * 1000)
       .toISOString().slice(0, 10);
   }
-  const { hour } = londonParts(d);
-  if (hour < 1) {
+  const { wd, hour } = londonParts(d);
+  // 周日 23:00 开盘 → 交易上属于「周一」交易日，往后推一天
+  if (wd === 0 && hour >= 23) {
+    const dt = new Date(`${lon}T12:00:00Z`);
+    dt.setUTCDate(dt.getUTCDate() + 1);
+    return dt.toISOString().slice(0, 10);
+  }
+  // 周二~周六 凌晨（休市窗口内）→ 属于前一交易日
+  // 注意：周一凌晨不回推 —— 周一 00:00 是周日 23:00 开盘的延续，本来就是周一交易日
+  if (wd >= 2 && wd <= 6 && hour < 1) {
     const dt = new Date(`${lon}T12:00:00Z`);
     dt.setUTCDate(dt.getUTCDate() - 1);
-    lon = dt.toISOString().slice(0, 10);
+    return dt.toISOString().slice(0, 10);
   }
   return lon;
+}
+
+/**
+ * WTI 交易日 YYYY-MM-DD（芝加哥/美中时间为准）。
+ * CME 规则：周日 17:00 开盘，每天 16:00 收盘、17:00 再开盘。
+ * 所以芝加哥 17:00 之后属于「下一个」交易日。
+ */
+function wtiTradingDateString(d = new Date()) {
+  let chi;
+  try {
+    chi = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Chicago', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(d);
+  } catch (e) {
+    chi = new Date(d.getTime() - 6 * 3600 * 1000).toISOString().slice(0, 10);
+  }
+  const { hour } = chicagoParts(d);
+  if (hour >= 17) {
+    const dt = new Date(`${chi}T12:00:00Z`);
+    dt.setUTCDate(dt.getUTCDate() + 1);
+    return dt.toISOString().slice(0, 10);
+  }
+  return chi;
 }
 
 /** 北京时间小时数（0-23），用于 cron 内部分支判断 */
@@ -155,6 +221,18 @@ function londonClock(d = new Date()) {
   }
 }
 
+/** 芝加哥本地时间（仅用于日志，方便你核对 WTI 闸门行为） */
+function chicagoClock(d = new Date()) {
+  try {
+    return new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'America/Chicago', weekday: 'short',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    }).format(d);
+  } catch (e) {
+    return 'n/a';
+  }
+}
+
 /** 解析伦敦本地时间 → { wd: 0=周日..6=周六, hour: 0-23 } */
 function londonParts(d = new Date()) {
   try {
@@ -171,52 +249,84 @@ function londonParts(d = new Date()) {
   return { wd: lon.getUTCDay(), hour: lon.getUTCHours() };
 }
 
-// ============================================================
-// 布伦特原油交易时段闸门（省 API 配额的关键）
-// ------------------------------------------------------------
-// 以「伦敦本地时间」判断，而不是写死北京时间 —— 这样英国在
-// 10 月底切换冬令时（BST -> GMT）时会自动跟随，不需要改代码。
-//
-//  伦敦时间            北京时间(夏令时/冬令时)
-//  周日 01:00 开盘     周日 08:00 / 09:00
-//  周一~周五 01:00-23:00 交易
-//  每天 23:00 休市      06:00 / 07:00（次日）
-//  周五 23:00 收盘     周六 06:00 / 07:00
-//  周六 全天休市       约 26 小时完全不动
-//
-// 周末那段是最大的浪费源：不加这道闸门，cron 会在休市的 26 小时里
-// 傻傻地抓 26 次，每次都拿到同一个休市价。
-// ============================================================
-function isBrentTrading(d = new Date()) {
-  const { wd, hour } = londonParts(d);
-  if (wd === 6) return false;               // 周六 全天休市
-  if (wd === 5 && hour >= 23) return false; // 周五 23:00 收盘
-  if (wd === 0 && hour < 1) return false;   // 周日 01:00 才开盘
-  if (hour >= 23 || hour < 1) return false; // 每日结算休市 23:00-01:00
-  return true;
+/** 解析芝加哥（美中）本地时间 → { wd: 0=周日..6=周六, hour: 0-23 } —— WTI 用 */
+function chicagoParts(d = new Date()) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'America/Chicago', weekday: 'short', hour: '2-digit', hour12: false,
+    }).formatToParts(d);
+    const get = t => (parts.find(p => p.type === t) || {}).value || '';
+    const wd = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'].indexOf(get('weekday').toLowerCase());
+    const hour = parseInt(get('hour'), 10);
+    if (wd >= 0 && !isNaN(hour)) return { wd, hour };
+  } catch (e) { /* fall through */ }
+  const c = new Date(d.getTime() - 6 * 3600 * 1000);
+  return { wd: c.getUTCDay(), hour: c.getUTCHours() };
+}
+
+/**
+ * cron 相位判定。
+ * cron 改为 "5,20 * * * *"：每小时跑两次。
+ *   :05 → 'open'  盘中采样（开盘那小时即为「开盘后 5 分钟」）
+ *   :20 → 'close' 收盘补抓（休市那小时即为「休市后 20 分钟」）
+ * 伦敦 / 芝加哥与 UTC 的时差都是整小时，分钟数无需换算。
+ */
+function cronPhase(d = new Date()) {
+  return d.getUTCMinutes() < 10 ? 'open' : 'close';
 }
 
 // ============================================================
-// 收盘补抓窗口（★ 本次新增，最重要的一条）
-// ------------------------------------------------------------
-// 问题：市场 23:00 休市，但如果最后一次抓取卡在 22:00（休市前 1 小时），
-//       拿到的就不是当日最终价，之后又不再抓 —— 当天价格就定错在半路上。
-//
-// 解决：休市后「再抓一次」，把当日最终价钉死。
-//   · 伦敦 00:00 = 休市后 1 小时   → 补抓（本次新增）
-//   · 伦敦 01:00 = 休市后 2 小时   → 新交易日开盘，交易时段本来就会抓
-//   两个点都覆盖到，确保休市后 1~2 小时内必定有一次抓取。
-//
-//  周二~周五 00:00 → 拿到「前一交易日当日收盘价」
-//  周六     00:00 → 拿到「周五周收盘价」★ 整个周末都显示它，最关键
-//  周日     00:00 → 跳过（01:00 才开盘，此时抓到的仍是沿用值，浪费）
-//
-// 夏令时：伦敦 00:00 = 北京 07:00；冬令时：伦敦 00:00 = 北京 08:00
 // ============================================================
-function isClosingWindow(d = new Date()) {
+// ★ v8 重写：布伦特与 WTI 拆成两套独立闸门
+// ------------------------------------------------------------
+// 两个品种的交易时段【不一样】，不能共用一套判断：
+//
+//  布伦特 Brent（ICE，以伦敦本地时间判断，英国 BST/GMT 自动跟随）
+//   · 周日 23:00 开盘（ICE 官方合约规格明确写了「Open 01:00 (23.00 on Sundays)」）
+//   · 周一~周五 23:00 收盘
+//   · 每日休市 2 小时：23:00 - 01:00
+//   · 周六全天休市
+//   ※ 关键：周一 00:00 是「周日 23:00 开盘」的延续，属于交易时段，
+//     旧代码写死 hour>=1 会把周一凌晨误判为休市，丢掉开盘后第一个点。
+//
+//  WTI（CME Globex，以芝加哥/美中时间判断，美国 CDT/CST 自动跟随）
+//   · 周日 17:00 开盘
+//   · 周一~周五 16:00 收盘
+//   · 每日休市 1 小时：16:00 - 17:00  ←★ 只有 1 小时，比布伦特短一半
+//   · 周六全天休市
+//   ※ 关键：旧逻辑「休市后 1 小时再抓」套到 WTI 上会落在 17:00，
+//     那是【重新开盘】的时刻，抓到的是新交易日开盘价而不是收盘价。
+//
+// 两个品种都用「本地时间」判断而不是写死北京时间 —— 英国 10 月底切冬令时、
+// 美国 11 月初切冬令时，都能自动跟随，不需要改代码。
+// ============================================================
+function isBrentTrading(d = new Date()) {
   const { wd, hour } = londonParts(d);
-  if (wd === 0) return false;   // 周日开盘前不补抓
-  return hour === 0;            // 休市后 1 小时
+  if (wd === 6) return false;                       // 周六全天休市
+  if (wd === 0) return hour >= 23;                  // 周日 23:00 开盘
+  return hour < 23;                                 // 周一~周五 23:00 收盘
+}
+
+/** 布伦特收盘补抓窗口 = 休市第 1 小时（伦敦 23:00-24:00），配合 :20 即「休市后 20 分钟」 */
+function isBrentClosing(d = new Date()) {
+  const { wd, hour } = londonParts(d);
+  if (wd === 0 || wd === 6) return false;
+  return hour === 23;
+}
+
+function isWtiTrading(d = new Date()) {
+  const { wd, hour } = chicagoParts(d);
+  if (wd === 6) return false;                       // 周六全天休市
+  if (wd === 0) return hour >= 17;                  // 周日 17:00 开盘
+  if (wd === 5) return hour < 16;                   // 周五 16:00 周收盘
+  return hour !== 16;                               // 周一~周四：仅 16:00-17:00 休市
+}
+
+/** WTI 收盘补抓窗口 = 芝加哥 16:00-17:00 那 1 小时，配合 :20 即「休市后 20 分钟」 */
+function isWtiClosing(d = new Date()) {
+  const { wd, hour } = chicagoParts(d);
+  if (wd === 0 || wd === 6) return false;
+  return hour === 16;
 }
 
 // ============================================================
@@ -354,7 +464,7 @@ export default {
 
       // 首屏只读缓存，绝不触发抓取（省配额）
       let o = oilCached, g = goldCached, cn = cnCached;
-      if (!o) o = (await fetchAndSave(env, false)).data;
+      if (!o) o = (await fetchAndSave(env, false, { brent: true, wti: true, force: true })).data;
       if (!g) g = (await fetchGoldAndSave(env, { bootstrap: true })).data;
       if (!cn) cn = await fetchCnOilAll(env);
 
@@ -493,10 +603,12 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
         // 闸门状态：方便你核对「该抓的时候到底抓没抓」
         tradingWindow: {
           beijingHour: beijingHour(now),
+          cronPhase: cronPhase(now),
           londonClock: londonClock(now),
-          brentTrading: isBrentTrading(now),
-          closingWindow: isClosingWindow(now),
-          note: 'brentTrading=false 且 closingWindow=false 时 cron 跳过抓取（休市）；手动 /update 不受影响',
+          chicagoClock: chicagoClock(now),
+          brent: { trading: isBrentTrading(now), closing: isBrentClosing(now) },
+          wti:   { trading: isWtiTrading(now),   closing: isWtiClosing(now) },
+          note: 'cron "5,20 * * * *"：:05=盘中采样，:20=收盘补抓。两品种闸门独立，任一为真即调 API',
         },
         oil,
         wti: wti || null,          // WTI 原油（同一次请求带回，不额外消耗配额）
@@ -560,7 +672,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
     // ---------------- /update ----------------
     if (url.pathname === '/update') {
       const results = await Promise.allSettled([
-        fetchAndSave(env, false),
+        fetchAndSave(env, false, { brent: true, wti: true, force: true }),
         fetchGoldAndSave(env, { manual: true }),
         fetchCnOilAll(env, { manual: true }),
       ]);
@@ -667,15 +779,20 @@ ${histDetail}
     // 国内油价：每天 08:00 一次（万维易源 7-8 点更新后再拉）
     if (h === 8) jobs.push(fetchCnOilAll(env));
 
-    // 原油：交易时段每小时抓 + 休市后 1 小时补抓一次（钉死当日最终价）
-    const trading = isBrentTrading(now);
-    const closing = isClosingWindow(now);
+    // 原油：布伦特与 WTI 各自判断，任一在交易/收盘窗口就抓（一次请求带回两个价）
+    const ph = cronPhase(now);
+    const bOpen = ph === 'open' && isBrentTrading(now);
+    const wOpen = ph === 'open' && isWtiTrading(now);
+    const bClose = ph === 'close' && isBrentClosing(now);
+    const wClose = ph === 'close' && isWtiClosing(now);
 
-    if (trading || closing) {
-      jobs.push(fetchAndSave(env, closing));   // closing=true → 标记为「当日收盘价」
-      console.log(`[cron] 原油抓取 — 北京 ${h}:00，伦敦 ${londonClock(now)}，${closing ? '收盘补抓' : '盘中'}`);
+    if (bOpen || wOpen || bClose || wClose) {
+      const rec = { brent: bOpen || bClose, wti: wOpen || wClose };
+      jobs.push(fetchAndSave(env, bClose || wClose, rec));
+      console.log(`[cron] 原油抓取 — 北京 ${h}:${String(now.getUTCMinutes()).padStart(2, '0')}，伦敦 ${londonClock(now)}，芝加哥 ${chicagoClock(now)}`);
+      console.log(`[cron]   布伦特 ${bClose ? '★收盘' : bOpen ? '盘中' : '不记'} / WTI ${wClose ? '★收盘' : wOpen ? '盘中' : '不记'}`);
     } else {
-      console.log(`[cron] 布伦特休市，跳过 — 北京 ${h}:00，伦敦 ${londonClock(now)}`);
+      console.log(`[cron] 两品种均休市，跳过 — 北京 ${h}:${String(now.getUTCMinutes()).padStart(2, '0')}，伦敦 ${londonClock(now)}，芝加哥 ${chicagoClock(now)}`);
     }
 
     if (!jobs.length) return;
@@ -684,10 +801,16 @@ ${histDetail}
 };
 
 // ================= 原油 =================
-// isClosing = true 表示这次是「休市后 1 小时」的收盘补抓，抓到的是当日最终价
-async function fetchAndSave(env, isClosing = false) {
+// isClosing = true 表示这次是「休市后 20 分钟」的收盘补抓，抓到的是当日最终价
+// record = { brent, wti } 指明本次抓取要往哪个品种的历史走势里记
+//          （两品种休市时段不同，必须分开判断，否则休市的那个会被污染）
+async function fetchAndSave(env, isClosing = false, record = null) {
   const apiKey = env.OILPRICEAPI_KEY;
   if (!apiKey) throw new Error('Missing OILPRICEAPI_KEY');
+
+  // 手动触发（bootstrap / /update）没有相位概念 → 两个品种都记、且跳过闸门
+  const recBrent = record ? !!record.brent : true;
+  const recWti   = record ? !!record.wti   : true;
 
   const prev = await env.OIL_KV.get('oil_data', 'json').catch(() => null);
 
@@ -738,23 +861,29 @@ async function fetchAndSave(env, isClosing = false) {
     };
     await env.OIL_KV.put('wti_data', JSON.stringify(wti), { expirationTtl: 86400 * 2 });
 
-    // WTI 同样攒走势 —— 与布伦特完全同一套规则、同一时刻写入，零额外额度。
+    // WTI 攒走势 —— 只在 WTI 自己的交易/收盘窗口内记（force=手动时不设限）。
     // 失败也不影响布伦特（各自独立 catch）。
-    await recordDailyHistory(env, {
-      price: wti.price,
-      isClosing: !!isClosing,
-      kvKey: 'wti_history',
-      label: 'WTI 原油',
-    }).catch(() => {});
+    if (recWti) {
+      await recordDailyHistory(env, {
+        price: wti.price,
+        isClosing: !!isClosing && isWtiClosing(),
+        kvKey: 'wti_history',
+        label: 'WTI 原油',
+        force: !!record?.force,
+      }).catch(() => {});
+    }
   }
 
   // 顺手把本次价格记进历史走势（自建累积，零额外额度）
-  await recordDailyHistory(env, {
-    price: result.price,
-    isClosing: !!isClosing,
-    kvKey: 'brent_history',
-    label: '布伦特原油',
-  }).catch(() => {});
+  if (recBrent) {
+    await recordDailyHistory(env, {
+      price: result.price,
+      isClosing: !!isClosing && isBrentClosing(),
+      kvKey: 'brent_history',
+      label: '布伦特原油',
+      force: !!record?.force,
+    }).catch(() => {});
+  }
 
   return { data: result, wti, prev, skipped: false };
 }
@@ -846,6 +975,11 @@ function isWeekdayInLondon(day) {
   return wd >= 1 && wd <= 5;
 }
 
+function isWeekdayInChicago(day) {
+  const { wd } = chicagoParts(new Date(`${day}T12:00:00Z`));  // 取当日芝加哥中午，避开跨日边界
+  return wd >= 1 && wd <= 5;
+}
+
 // ============================================================
 // 自建历史走势：把每次抓取的价格累积成日线
 // ------------------------------------------------------------
@@ -860,18 +994,28 @@ function isWeekdayInLondon(day) {
 //
 // 布伦特与 WTI 共用此函数，靠 kvKey 区分（同一套规则、同一时刻写入）。
 // ============================================================
-async function recordDailyHistory(env, { price, isClosing, kvKey = 'brent_history', label = '布伦特原油' }) {
+async function recordDailyHistory(env, { price, isClosing, kvKey = 'brent_history', label = '布伦特原油', force = false }) {
   const num = Number(price);
   if (!Number.isFinite(num)) return null;
 
   const now = new Date();
-  if (!isBrentTrading(now) && !isClosingWindow(now)) return null;  // 休市沿用量不记录
+  const isWti = kvKey === 'wti_history';
 
-  const day = tradingDateString(now);
+  // ★ 按品种各自判断：布伦特看伦敦，WTI 看芝加哥。
+  //   两品种休市时段不同（布伦特 2 小时、WTI 1 小时），共用一套会让休市的那个被沿用值污染。
+  //   force=true（手动 /update）时跳过闸门，照记。
+  if (!force) {
+    const gate = isWti
+      ? (isWtiTrading(now) || isWtiClosing(now))
+      : (isBrentTrading(now) || isBrentClosing(now));
+    if (!gate) return null;
+  }
+
+  const day = isWti ? wtiTradingDateString(now) : tradingDateString(now);
   // 周六周日没有交易，即使补抓拿到的也是沿用值 —— 不建这一天的记录，
-  // 否则走势图上会出现「休市日」的点（周五收盘补抓落在周六 00:00，
-  // tradingDateString 会往前推回周五，所以不受影响）。
-  if (!isWeekdayInLondon(day)) return null;
+  // 否则走势图上会出现「休市日」的点。
+  const weekdayOk = isWti ? isWeekdayInChicago(day) : isWeekdayInLondon(day);
+  if (!weekdayOk) return null;
 
   const hist = await env.OIL_KV.get(kvKey, 'json').catch(() => null);
   const rows = Array.isArray(hist?.rows) ? hist.rows.slice() : [];
