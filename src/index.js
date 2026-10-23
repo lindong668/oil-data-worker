@@ -29,7 +29,7 @@
  *
  * v7 改动：新增 ACCESS_KEY 私有密钥（防止公网刷爆 API 配额）
  *
- * v8 改动（本次）：布伦特与 WTI 拆成两套独立交易时段闸门
+ * v8 改动：布伦特与 WTI 拆成两套独立交易时段闸门
  *  1. 【两个品种的交易时段本来就不一样，不能共用一套判断】
  *       布伦特（ICE，伦敦）：周日 23:00 开盘，周一~周五 23:00 收盘，
  *                            每日休市 2 小时（23:00-01:00），周六全天休市
@@ -61,6 +61,12 @@
  *
  *  实测消耗：130 次/周（改前 138），日均 18.6 次，峰值日 26 次，
  *            离 50 次/天上限很宽裕，且周日不再白烧。
+ *
+ * v8 附带：新增 /_schedule-preview 排班预演页（纯只读诊断）
+ *   部署后访问即可看到未来 N 天每一次 cron 触发的北京时间/伦敦/芝加哥
+ *   与两品种动作，当场核对闸门是否正确，不用等一周、不用翻日志。
+ *   该路由：不读 KV、不写 KV、不发外部请求、不触发抓取、不影响定时任务，
+ *   只调用已有纯函数做算术推演，对现有功能零影响（无密钥返回 404 隐身）。
  * ---------------------------------------------------------------
  */
 
@@ -644,6 +650,22 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
     }
 
     // ---------------- /clear-history 清空历史（自建累积，随时可重来）----------------
+    // ④ 排班预演（纯只读诊断）：无密钥直接 404，不暴露路径存在
+    //    ⚠️ 只调用已有的纯函数做算术推演，不读 KV、不写 KV、不发起任何网络请求，
+    //        对定时抓取、历史走势、/data 接口零影响。
+    if (url.pathname === '/_schedule-preview') {
+      if (!ok) return ghost();
+      const days = Math.min(Math.max(parseInt(url.searchParams.get('days') || '7', 10) || 7, 1), 14);
+      const fmt = url.searchParams.get('format') === 'json' ? 'json' : 'html';
+      const rows = previewSchedule(days);
+      if (fmt === 'json') {
+        return new Response(JSON.stringify({ days, count: rows.length, rows }, null, 2), {
+          headers: JSON_HEADERS,
+        });
+      }
+      return new Response(renderSchedulePreview(rows, days), { headers: HTML_HEADERS });
+    }
+
     if (url.pathname === '/clear-history') {
       const confirm = url.searchParams.get('confirm') === '1';
       const hKey = url.searchParams.get('code') === 'wti' ? 'wti' : 'brent';
@@ -1321,4 +1343,141 @@ ${thin ? `<p style="font-size:12px;color:#c0392b;margin-top:16px">
 定格后不再变动；涨跌幅按「收盘对收盘」计算，两端口径一致，相对最可信（美元/桶）。</p>
 <p><a href="/${keyQS}">← 返回首页</a> · <a href="/update${keyQS}">手动刷新</a> · <a href="/clear-history?code=${hKey}${keyQS.replace('?', '&')}">清空${L}历史</a></p>
 </body></html>`;
+}
+
+
+// ============================================================
+// 排班预演（v8 新增 · 纯只读诊断，不属于业务逻辑）
+// ------------------------------------------------------------
+// 作用：把未来 N 天 cron 会触发的每一次抓取，用【已有的那套闸门函数】
+//       原样推演一遍，输出成表格，方便部署后当场核对，不用等一周、不用翻日志。
+//
+// ⚠️ 安全性声明（这几点是本功能能被放心加上去的前提）：
+//   · 纯函数：只做日期算术 + 调用 isBrentTrading / isBrentClosing /
+//     isWtiTrading / isWtiClosing / cronPhase / tradingDateString /
+//     wtiTradingDateString —— 这些都是上面已有的纯函数，一个字符都没改
+//   · 不读 KV、不写 KV（完全不碰 env.OIL_KV）
+//   · 不发起任何外部请求（不调 fetch、不碰 OilPriceAPI 配额）
+//   · 不触发任何抓取（不调 fetchAndSave / fetchGoldAndSave / fetchCnOilAll）
+//   · 不影响 scheduled() 定时任务的任何一行
+//   · 不修改任何已有变量或已有函数
+//   · 默认 404 隐身：无密钥时返回 ghost()，路径不对外暴露
+//
+// 因此：加这个功能 = 加了一个「只读的说明书」，抓取行为与历史数据零变化。
+// ============================================================
+
+/**
+ * 推演未来 days 天的 cron 触发表。
+ * cron 为 "5,20 * * * *"，故每小时两个候选时刻：UTC :05 与 :20。
+ * @returns {Array} 每次触发的明细
+ */
+function previewSchedule(days = 7) {
+  const rows = [];
+  const now = new Date();
+  // 从当前小时的 :05 起算（若已过 :20 则顺延到下一小时）
+  let base = new Date(now);
+  base.setUTCSeconds(0, 0);
+  base.setUTCMinutes(0, 0);
+  const total = days * 24;
+
+  for (let i = 0; i < total; i++) {
+    const h = new Date(base.getTime() + i * 3600000);
+    for (const m of [5, 20]) {
+      const d = new Date(h.getTime() + m * 60000);
+      const ph = cronPhase(d);
+      // 与 scheduled() 完全相同的判定式 —— 保证预演 == 实际行为
+      const bOpen  = ph === 'open'  && isBrentTrading(d);
+      const wOpen  = ph === 'open'  && isWtiTrading(d);
+      const bClose = ph === 'close' && isBrentClosing(d);
+      const wClose = ph === 'close' && isWtiClosing(d);
+      if (!(bOpen || wOpen || bClose || wClose)) continue;
+
+      rows.push({
+        utc: d.toISOString(),
+        beijing: fmtTz(d, 'Asia/Shanghai'),
+        london: fmtTz(d, 'Europe/London'),
+        chicago: fmtTz(d, 'America/Chicago'),
+        phase: ph === 'open' ? ':05 盘中' : ':20 收盘',
+        brent: bClose ? '★收盘' : bOpen ? '盘中' : '不记',
+        wti:   wClose ? '★收盘' : wOpen ? '盘中' : '不记',
+        brentDay: tradingDateString(d),
+        wtiDay:   wtiTradingDateString(d),
+        callApi: true,
+      });
+    }
+  }
+  return rows;
+}
+
+/** 把某时刻格式化成指定时区的 "MM-DD 周X HH:MM" */
+function fmtTz(d, tz) {
+  try {
+    const wd = new Intl.DateTimeFormat('en-GB', { timeZone: tz, weekday: 'short' })
+      .format(d).toLowerCase().slice(0, 3);
+    const md = new Intl.DateTimeFormat('en-CA', { timeZone: tz, month: '2-digit', day: '2-digit' }).format(d);
+    const hm = new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
+    const map = { sun: '周日', mon: '周一', tue: '周二', wed: '周三', thu: '周四', fri: '周五', sat: '周六' };
+    return `${md} ${map[wd] || wd} ${hm}`;
+  } catch (e) {
+    return 'n/a';
+  }
+}
+
+/** 排班预演页（HTML 表格） */
+function renderSchedulePreview(rows, days) {
+  const byDay = {};
+  rows.forEach(r => {
+    const k = r.beijing.slice(0, 6);   // MM-DD
+    (byDay[k] = byDay[k] || []).push(r);
+  });
+
+  let html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>排班预演 · 未来 ${days} 天</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f8fafc;color:#1e293b;margin:0;padding:24px}
+h1{font-size:22px;margin:0 0 6px}h2{font-size:18px;margin:28px 0 10px}
+.sub{color:#64748b;font-size:14px;margin-bottom:18px}
+.note{background:#fffbeb;border-left:4px solid #f59e0b;padding:12px 16px;border-radius:6px;font-size:14px;margin:16px 0;line-height:1.7}
+.ok{background:#f0fdf4;border-left:4px solid #22c55e;padding:12px 16px;border-radius:6px;font-size:14px;margin:16px 0;line-height:1.7}
+table{border-collapse:collapse;width:100%;background:#fff;font-size:13px;box-shadow:0 1px 3px rgba(0,0,0,.06);border-radius:8px;overflow:hidden}
+th{background:#1e3a5f;color:#fff;padding:9px 10px;text-align:left;font-weight:500;white-space:nowrap}
+td{padding:8px 10px;border-top:1px solid #e2e8f0;white-space:nowrap}
+tr:nth-child(even) td{background:#f8fafc}
+.c{color:#2563eb;font-weight:600}.w{color:#d97706;font-weight:600}
+.dim{color:#94a3b8}.keyline td{background:#fef3c7 !important}
+code{background:#e2e8f0;padding:2px 6px;border-radius:4px;font-size:13px}
+</style></head><body>
+<h1>排班预演 · 未来 ${days} 天</h1>
+<div class="sub">共 <b>${rows.length}</b> 次触发 · 生成于 ${fmtTz(new Date(), 'Asia/Shanghai')}（北京时间）</div>
+<div class="ok"><b>本页为纯只读诊断</b>：不读 KV、不写 KV、不发起外部请求、不触发任何抓取、不影响定时任务。
+数据由现有闸门函数实时推演，<b>与实际 cron 行为一致</b>。</div>
+<div class="note">
+<b>怎么用：</b>只需核对「伦敦 / 芝加哥」这两列 —— 判断基准是<b>市场当地时间</b>，不是北京时间。<br>
+· 布伦特 <code>★收盘</code> 必须落在伦敦 <code>23:xx</code><br>
+· WTI <code>★收盘</code> 必须落在芝加哥 <code>16:xx</code><br>
+· 伦敦或芝加哥为<b>周六</b>时，两品种都应为「不记」或整行不出现<br>
+· 周日只应有 1~2 次（伦敦 23:xx / 芝加哥 17:xx 之后才算开盘）
+</div>`;
+
+  Object.keys(byDay).sort().forEach(k => {
+    const list = byDay[k];
+    html += `<h2>${k}　<span class="sub">${list.length} 次</span></h2><table>
+<tr><th>北京时间</th><th>伦敦(布伦特基准)</th><th>芝加哥(WTI基准)</th><th>相位</th><th>布伦特</th><th>WTI</th><th>布伦特交易日</th><th>WTI交易日</th></tr>`;
+    list.forEach(r => {
+      const key = r.brent === '★收盘' || r.wti === '★收盘' ? ' class="keyline"' : '';
+      html += `<tr${key}><td>${r.beijing}</td><td>${r.london}</td><td>${r.chicago}</td>
+<td class="dim">${r.phase}</td>
+<td class="c">${r.brent}</td><td class="w">${r.wti}</td>
+<td class="dim">${r.brentDay}</td><td class="dim">${r.wtiDay}</td></tr>`;
+    });
+    html += `</table>`;
+  });
+
+  html += `<div class="note" style="margin-top:24px">
+加 <code>?format=json</code> 返回 JSON；<code>?days=1~14</code> 调整天数（默认 7）。
+</div>
+<p style="margin-top:24px"><a href="/">← 返回首页</a></p></body></html>`;
+  return html;
 }
