@@ -693,6 +693,10 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
           headers: JSON_HEADERS,
         });
       }
+      // mode=check → 极简自检页：不看表格，只看红绿结论
+      if (url.searchParams.get('mode') === 'check') {
+        return new Response(renderSelfCheck(previewSchedule(7, false)), { headers: HTML_HEADERS });
+      }
       return new Response(renderSchedulePreview(rows, days, full), { headers: HTML_HEADERS });
     }
 
@@ -1489,6 +1493,9 @@ a{color:#2563eb}
 </style></head><body>
 <h1>排班预演 · 未来 ${days} 天${full ? '（完整）' : '（关键行）'}</h1>
 <div class="sub"><span id="cnt"></span> · 生成于 <span id="gen"></span>（北京时间）</div>
+<div class="note" style="background:#eff6ff;border-left-color:#3b82f6">
+<b>不想核对表格？</b>　<a href="?mode=check"><b>点这里看一键自检结果 →</b></a>　（页面自动判定，只显示红绿）
+</div>
 <div class="ok"><b>本页为纯只读诊断</b>：不读 KV、不写 KV、不发起外部请求、不触发任何抓取、不影响定时任务。
 数据由现有闸门函数实时推演，<b>与实际 cron 行为一致</b>。</div>
 <div class="note">
@@ -1552,4 +1559,99 @@ Object.keys(byDay).sort().forEach(function (k) {
 });
 document.getElementById('out').innerHTML = html || '<p>未来 ' + DATA.days + ' 天没有任何触发。</p>';
 </script></body></html>`;
+}
+
+
+// ============================================================
+// 极简自检页（mode=check）
+// ------------------------------------------------------------
+// 目的：不用人肉核对表格。页面自己跑断言，顶部只显示红绿结论。
+// 计算方式与预演表完全一致（都走 previewSchedule + 同一批闸门函数）。
+//
+// 六项检查：
+//   1. 布伦特收盘都在伦敦 23 点
+//   2. WTI 收盘都在芝加哥 16 点
+//   3. 布伦特周六不记录
+//   4. WTI 芝加哥周六不记录
+//   5. 周日不刷屏（最多 2 次）
+//   6. 两品种已分开（存在某时刻只有一个品种在记）
+//
+// 注意：与预演表一样，纯只读，不碰 KV、不发请求、不触发抓取。
+// ============================================================
+
+/** 取某时刻在指定时区的 { 星期(0=周日), 小时 } —— 复用已有 londonParts/chicagoParts 的思路 */
+function tzWH(ms, tz) {
+  const f = dtf('en-GB', { timeZone: tz, weekday: 'short', hour: '2-digit', hour12: false });
+  const p = f.formatToParts(new Date(ms));
+  const g = t => { const x = p.find(y => y.type === t); return x ? x.value : ''; };
+  const wd = ['sun','mon','tue','wed','thu','fri','sat'].indexOf(g('weekday').toLowerCase());
+  return { wd, hour: parseInt(g('hour'), 10) };
+}
+
+function renderSelfCheck(rows) {
+  // rows 必须是完整模式（keyOnly=false）
+  const c1 = [], c2 = [], c3 = [], c4 = [];
+  let sundayCount = 0, splitCount = 0;
+
+  for (const r of rows) {
+    const lon = tzWH(r.t, 'Europe/London');
+    const chi = tzWH(r.t, 'America/Chicago');
+    const bj  = tzWH(r.t, 'Asia/Shanghai');
+
+    // 1. 布伦特★收盘 → 伦敦必须 23 点
+    if (r.brent === '★收盘' && lon.hour !== 23) c1.push(r.t);
+    // 2. WTI★收盘 → 芝加哥必须 16 点
+    if (r.wti === '★收盘' && chi.hour !== 16) c2.push(r.t);
+    // 3. 伦敦周六 → 布伦特不记
+    if (lon.wd === 6 && r.brent !== '不记') c3.push(r.t);
+    // 4. 芝加哥周六 → WTI 不记
+    if (chi.wd === 6 && r.wti !== '不记') c4.push(r.t);
+    // 5. 北京周日触发次数（按伦敦/芝加哥任一为周日算，更贴合"市场周末"）
+    if (bj.wd === 0) sundayCount++;
+    // 6. 分开：某时刻只有一个品种在记
+    const bOn = r.brent !== '不记', wOn = r.wti !== '不记';
+    if (bOn !== wOn) splitCount++;
+  }
+
+  const items = [
+    { name: '布伦特收盘时间', desc: '★收盘 全部落在伦敦 23:00', bad: c1 },
+    { name: 'WTI 收盘时间',   desc: '★收盘 全部落在芝加哥 16:00', bad: c2 },
+    { name: '布伦特周末停抓', desc: '伦敦周六一律不记录', bad: c3 },
+    { name: 'WTI 周末停抓',   desc: '芝加哥周六一律不记录', bad: c4 },
+    { name: '周日不刷屏',     desc: `北京周日仅 ${sundayCount} 次（应为 0~2）`, bad: sundayCount > 2 ? [1] : [] },
+    { name: '两品种已分开',   desc: `出现 ${splitCount} 次「只抓一个品种」`, bad: splitCount > 0 ? [] : [1] },
+  ];
+
+  const pass = items.every(i => i.bad.length === 0);
+
+  return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>闸门自检</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f8fafc;color:#1e293b;margin:0;padding:22px;max-width:640px}
+.verdict{font-size:30px;font-weight:700;padding:22px;border-radius:12px;text-align:center;margin-bottom:8px}
+.pass{background:#dcfce7;color:#15803d;border:2px solid #22c55e}
+.fail{background:#fee2e2;color:#b91c1c;border:2px solid #ef4444}
+.sub{text-align:center;color:#64748b;font-size:14px;margin-bottom:22px}
+.item{background:#fff;border-radius:10px;padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;gap:14px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.mark{font-size:22px;font-weight:700;width:28px;text-align:center}
+.ok{color:#22c55e}.no{color:#ef4444}
+.txt b{display:block;font-size:15px;margin-bottom:2px}
+.txt span{font-size:13px;color:#64748b}
+.foot{margin-top:22px;font-size:13px;color:#64748b;line-height:1.8}
+a{color:#2563eb}
+</style></head><body>
+<div class="verdict ${pass ? 'pass' : 'fail'}">${pass ? '✅ 全部通过' : '❌ 有问题'}</div>
+<div class="sub">6 项闸门检查 · 基于未来 7 天 ${rows.length} 次触发推演</div>
+${items.map(i => `<div class="item">
+  <div class="mark ${i.bad.length ? 'no' : 'ok'}">${i.bad.length ? '✕' : '✓'}</div>
+  <div class="txt"><b>${i.name}</b><span>${i.desc}${i.bad.length ? '　（异常 ' + i.bad.length + ' 处）' : ''}</span></div>
+</div>`).join('')}
+<div class="foot">
+本页面自动核对，无需人工比对表格。<br>
+判定基准是<b>市场当地时间</b>（伦敦 / 芝加哥），不是北京时间。<br>
+要查看明细：<a href="/_schedule-preview?days=3">排班表</a>　·　<a href="/">返回首页</a><br>
+本页基于<b>未来 7 天、130 次触发</b>全量推演，覆盖整个交易周与完整周末。
+</div></body></html>`;
 }

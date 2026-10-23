@@ -107,3 +107,10 @@ head_sampling_rate = 1      # 100% 采样，不漏
 # ===================================================================
 [vars]
 ACCESS_KEY = "lfwczh8pa4atakrpj7uwhybo2vexc76u"
+
+# ---- 修复 Workers Builds 预览构建红叉 ----
+# 根因：CF 对同一次提交跑两套构建，生产 wrangler deploy 成功，
+#       预览 wrangler preview 要求配置中存在 [previews] 块。
+# 本站有 1 个 vars，故需写全对应变量（留空占位）。
+[previews.vars]
+ACCESS_KEY = ""
