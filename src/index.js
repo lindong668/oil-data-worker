@@ -29,7 +29,7 @@
  *
  * v7 改动：新增 ACCESS_KEY 私有密钥（防止公网刷爆 API 配额）
  *
- * v8 改动：布伦特与 WTI 拆成两套独立交易时段闸门
+ * v8 改动（本次）：布伦特与 WTI 拆成两套独立交易时段闸门
  *  1. 【两个品种的交易时段本来就不一样，不能共用一套判断】
  *       布伦特（ICE，伦敦）：周日 23:00 开盘，周一~周五 23:00 收盘，
  *                            每日休市 2 小时（23:00-01:00），周六全天休市
@@ -62,20 +62,18 @@
  *  实测消耗：130 次/周（改前 138），日均 18.6 次，峰值日 26 次，
  *            离 50 次/天上限很宽裕，且周日不再白烧。
  *
- * v8 附带：新增 /_schedule-preview 排班预演页（纯只读诊断）
- *   部署后访问即可看到未来 N 天 cron 触发的关键时刻，当场核对闸门，
- *   不用等一周、不用翻日志。不读 KV、不写 KV、不发外部请求、
- *   不触发抓取、不影响定时任务；无密钥返回 404 隐身。
+ * v8 附带：/_schedule-preview 排班预演页（纯只读诊断）
+ *   不读 KV、不写 KV、不发外部请求、不触发抓取、不影响定时任务；
+ *   无密钥返回 404 隐身。
  *
  * v8.1 修复：预演页曾触发 Error 1102（Worker exceeded resource limits）
- *   根因：每行的三地时间都在 Worker 里 new Intl.DateTimeFormat —— 首次创建
- *        带 timeZone 的 formatter 需加载 ICU 时区数据，一个就要好几 ms，
- *        7 天 × 上千次 = 310ms，远超 CPU 上限。
- *   修复：① 全局 dtf() 缓存 formatter（对所有调用方行为完全等价，
- *           已用 8784 次比对验证 100% 一致）
- *         ② 预演改为「两阶段」：主循环只判定，只给保留行做昂贵计算
- *         ③ 三地时间字符串改由浏览器端 JS 渲染，Worker 只吐毫秒时间戳
- *   效果：稳态 7 天关键行 310ms → 5.4ms（约 1/57），HTML 31KB → 7.4KB
+ *   根因：每行三地时间都在 Worker 里 new Intl.DateTimeFormat，首次创建带
+ *         timeZone 的 formatter 要加载 ICU 时区数据，一个好几 ms，
+ *         7 天上千次 = 310ms，远超 Workers CPU 上限。
+ *   修复：① 全局 dtf() 缓存（8784 次比对验证 100% 等价）
+ *         ② 两阶段：主循环只判定，昂贵计算只给保留行
+ *         ③ 三地时间改由浏览器端 JS 渲染，Worker 只吐毫秒时间戳
+ *   效果：7 天关键行 310ms → 5.3ms；HTML 31KB → 7.4KB
  * ---------------------------------------------------------------
  */
 
@@ -142,10 +140,29 @@ const HISTORY_MAX_ROWS = 400;
 // 所以：样本不足就不展示高/低，只保留有意义的收盘价。宁缺毋滥。
 const SAMPLES_MIN = 3;
 
+// ------------------------------------------------------------
+// Intl.DateTimeFormat 实例化开销很大（带 timeZone 的首次创建需加载
+// ICU 时区数据，一个数毫秒）。排班预演一次要格式化上千次，若每次新建
+// 会直接触发 Workers 的 CPU 上限（Error 1102）。
+// 这里做进程级缓存：同一 (locale, options) 只建一次，之后复用。
+// ⚠️ 纯性能优化，返回值与 new Intl.DateTimeFormat(...) 完全等价。
+// ------------------------------------------------------------
+const __DTF_CACHE = new Map();
+function dtf(locale, options) {
+  const keys = Object.keys(options).sort();
+  const k = locale + '|' + keys.map(x => x + ':' + String(options[x])).join(',');
+  let f = __DTF_CACHE.get(k);
+  if (!f) {
+    f = new Intl.DateTimeFormat(locale, options);
+    __DTF_CACHE.set(k, f);
+  }
+  return f;
+}
+
 /** 北京时间日期串 YYYY-MM-DD（用于「每天一次」的闸门判断） */
 function beijingDateString(d = new Date()) {
   try {
-    return new Intl.DateTimeFormat('en-CA', {
+    return dtf('en-CA', {
       timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
     }).format(d);
   } catch (e) {
@@ -216,7 +233,7 @@ function wtiTradingDateString(d = new Date()) {
 /** 北京时间小时数（0-23），用于 cron 内部分支判断 */
 function beijingHour(d = new Date()) {
   try {
-    return +new Intl.DateTimeFormat('en-GB', {
+    return +dtf('en-GB', {
       timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false,
     }).format(d);
   } catch (e) {
@@ -249,26 +266,6 @@ function chicagoClock(d = new Date()) {
 }
 
 /** 解析伦敦本地时间 → { wd: 0=周日..6=周六, hour: 0-23 } */
-// ------------------------------------------------------------
-// Intl.DateTimeFormat 实例化开销极大（每次约 0.2ms）。
-// 排班预演一次要格式化上千次，若每次新建对象会直接触发
-// Workers 的 CPU 上限（Error 1102 / "Worker exceeded resource limits"）。
-// 这里做一层进程级缓存：同一 (locale, options) 只建一次，之后复用。
-// ⚠️ 纯性能优化，不改变任何格式化结果 —— 对所有调用方行为完全等价。
-// ------------------------------------------------------------
-const __DTF_CACHE = new Map();
-function dtf(locale, options) {
-  // 用稳定的 key：locale + 按字母序排列的 options
-  const keys = Object.keys(options).sort();
-  const k = locale + '|' + keys.map(x => x + ':' + String(options[x])).join(',');
-  let f = __DTF_CACHE.get(k);
-  if (!f) {
-    f = new Intl.DateTimeFormat(locale, options);
-    __DTF_CACHE.set(k, f);
-  }
-  return f;
-}
-
 function londonParts(d = new Date()) {
   try {
     const parts = dtf('en-GB', {
@@ -681,18 +678,18 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
     // ---------------- /clear-history 清空历史（自建累积，随时可重来）----------------
     // ④ 排班预演（纯只读诊断）：无密钥直接 404，不暴露路径存在
     //    ⚠️ 只调用已有的纯函数做算术推演，不读 KV、不写 KV、不发起任何网络请求，
-    //        对定时抓取、历史走势、/data 接口零影响。
+    //        不触发任何抓取，对定时抓取、历史走势、/data 接口零影响。
     if (url.pathname === '/_schedule-preview') {
       if (!ok) return ghost();
-      // 默认只算「关键行」：约 30 行、几毫秒，远低于 Workers CPU 上限。
-      // ?full=1 才展开全部（7 天约 130 行，能开但更吃 CPU，天数会自动限到 5）。
+      // 默认只算「关键行」：约 26 行、几毫秒，远低于 Workers CPU 上限。
+      // ?full=1 才展开全部（默认 5 天，上限 5）。
       const full = url.searchParams.get('full') === '1';
       const maxDays = full ? 5 : 7;
       const days = Math.min(Math.max(parseInt(url.searchParams.get('days') || '3', 10) || 3, 1), maxDays);
       const fmt = url.searchParams.get('format') === 'json' ? 'json' : 'html';
       const rows = previewSchedule(days, !full);
       if (fmt === 'json') {
-        return new Response(JSON.stringify({ days, count: rows.length, rows }, null, 2), {
+        return new Response(JSON.stringify({ days, full, count: rows.length, rows }, null, 2), {
           headers: JSON_HEADERS,
         });
       }
@@ -1378,43 +1375,42 @@ ${thin ? `<p style="font-size:12px;color:#c0392b;margin-top:16px">
 </body></html>`;
 }
 
-
 // ============================================================
-// 排班预演（v8 新增 · 纯只读诊断，不属于业务逻辑）
+// 排班预演（v8 / v8.1 新增 · 纯只读诊断，不属于业务逻辑）
 // ------------------------------------------------------------
-// 作用：把未来 N 天 cron 会触发的每一次抓取，用【已有的那套闸门函数】
-//       原样推演一遍，输出成表格，方便部署后当场核对，不用等一周、不用翻日志。
+// 作用：把未来 N 天 cron 会触发的抓取，用【已有的那套闸门函数】原样推演，
+//       输出成表格，方便部署后当场核对，不用等一周、不用翻日志。
 //
-// ⚠️ 安全性声明（这几点是本功能能被放心加上去的前提）：
+// ⚠️ 安全性声明（本功能能被放心加上去的前提）：
 //   · 纯函数：只做日期算术 + 调用 isBrentTrading / isBrentClosing /
 //     isWtiTrading / isWtiClosing / cronPhase / tradingDateString /
-//     wtiTradingDateString —— 这些都是上面已有的纯函数，一个字符都没改
+//     wtiTradingDateString —— 这些都是上面已有的纯函数，判定逻辑一字未改
 //   · 不读 KV、不写 KV（完全不碰 env.OIL_KV）
-//   · 不发起任何外部请求（不调 fetch、不碰 OilPriceAPI 配额）
+//   · 不发起任何外部请求（不调 fetch、不碰 API 配额）
 //   · 不触发任何抓取（不调 fetchAndSave / fetchGoldAndSave / fetchCnOilAll）
 //   · 不影响 scheduled() 定时任务的任何一行
-//   · 不修改任何已有变量或已有函数
+//   · 不修改任何已有函数的判定逻辑
 //   · 默认 404 隐身：无密钥时返回 ghost()，路径不对外暴露
 //
-// 因此：加这个功能 = 加了一个「只读的说明书」，抓取行为与历史数据零变化。
+// v8.1：曾触发 Error 1102（Worker exceeded resource limits）。
+//   根因是每行的三地时间都在 Worker 内 new Intl.DateTimeFormat。
+//   修复：① 全局 dtf() 缓存  ② 两阶段（主循环只判定）
+//         ③ 三地时间改由浏览器端 JS 渲染，Worker 只吐毫秒时间戳
 // ============================================================
 
 /**
  * 推演未来 days 天的 cron 触发表。
  * cron 为 "5,20 * * * *"，故每小时两个候选时刻：UTC :05 与 :20。
- * @returns {Array} 每次触发的明细
+ * @param {number} days    天数
+ * @param {boolean} keyOnly true = 只保留关键行（收盘 / 开盘 / 周末边界）
  */
-function previewSchedule(days = 7, keyOnly = true) {
-  const now = new Date();
-  let base = new Date(now);
+function previewSchedule(days = 3, keyOnly = true) {
+  const base = new Date();
   base.setUTCSeconds(0, 0);
   base.setUTCMinutes(0, 0);
   const total = days * 24;
 
-  // ---- 第一轮：只做闸门判定，不做任何字符串格式化 ----
-  // 判定时钟（londonParts / chicagoParts）内部已复用缓存的 formatter，很便宜；
-  // 真正贵的（交易日换算 + 三地时间字符串）留到第二轮只给保留行做，
-  // 这样 7 天 336 次循环里绝大部分只需跑两次 formatToParts。
+  // ---- 第一轮：只做闸门判定，不做任何显示用格式化 ----
   const hits = [];
   for (let i = 0; i < total; i++) {
     const h = new Date(base.getTime() + i * 3600000);
@@ -1436,13 +1432,9 @@ function previewSchedule(days = 7, keyOnly = true) {
     }
   }
 
-  // ---- 第二轮：筛选出需要展示的行 ----
+  // ---- 第二轮：只保留需要核对的行 ----
   let kept = hits;
   if (keyOnly) {
-    // 只保留真正需要核对的行，既省 CPU 又更聚焦：
-    //  · ★收盘（任一品种）
-    //  · 开盘首抓（某品种由「不记」翻转为「盘中」的那一行）
-    //  · 周末边界（伦敦或芝加哥落在周六/周日，用来确认确实没抓）
     const out = [];
     let prevB = null, prevW = null;
     for (const r of hits) {
@@ -1450,7 +1442,6 @@ function previewSchedule(days = 7, keyOnly = true) {
       const wOn = r.wti !== '不记';
       const isClose = r.brent === '★收盘' || r.wti === '★收盘';
       const isOpen  = (bOn && !prevB) || (wOn && !prevW);
-      // 周末判定用低价方式：直接看星期，不做完整格式化
       const lp = londonParts(r.d), cp = chicagoParts(r.d);
       const isWeekend = lp.wd === 0 || lp.wd === 6 || cp.wd === 0 || cp.wd === 6;
       if (isClose || isOpen || isWeekend) {
@@ -1462,15 +1453,9 @@ function previewSchedule(days = 7, keyOnly = true) {
     kept = out;
   }
 
-  // ---- 第三轮：只算交易日，不做任何「显示用」的时间格式化 ----
-  // ⚠️ 重要：三地时间字符串（北京/伦敦/芝加哥）一律【不在 Worker 里格式化】。
-  //   首次创建带 timeZone 的 Intl.DateTimeFormat 要加载 ICU 时区数据，
-  //   一个就要好几 ms，预演页碰 5~7 个就直接触发 Error 1102
-  //   （"Worker exceeded resource limits"）。
-  //   所以这里只吐毫秒时间戳，交给页面里的浏览器端 JS 去渲染 —— 浏览器
-  //   做这个零成本，Worker 的 CPU 占用压到最低。
+  // ---- 第三轮：只给保留行算交易日，时间字符串交给浏览器 ----
   return kept.map(r => ({
-    t: r.d.getTime(),          // 毫秒时间戳，浏览器端格式化
+    t: r.d.getTime(),
     phase: r.phase,
     brent: r.brent,
     wti: r.wti,
@@ -1480,25 +1465,9 @@ function previewSchedule(days = 7, keyOnly = true) {
   }));
 }
 
-/** 把某时刻格式化成指定时区的 "MM-DD 周X HH:MM" */
-function fmtTz(d, tz) {
-  try {
-    const wd = dtf('en-GB', { timeZone: tz, weekday: 'short' })
-      .format(d).toLowerCase().slice(0, 3);
-    const md = dtf('en-CA', { timeZone: tz, month: '2-digit', day: '2-digit' }).format(d);
-    const hm = dtf('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
-    const map = { sun: '周日', mon: '周一', tue: '周二', wed: '周三', thu: '周四', fri: '周五', sat: '周六' };
-    return `${md} ${map[wd] || wd} ${hm}`;
-  } catch (e) {
-    return 'n/a';
-  }
-}
-
 /** 排班预演页：Worker 只吐数据，时间格式化交给浏览器端 JS（省 CPU） */
 function renderSchedulePreview(rows, days, full = false) {
-  // 把行数据序列化进页面，浏览器端再渲染成表格
   const payload = JSON.stringify({ days, full, rows });
-
   return `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
@@ -1537,7 +1506,7 @@ ${full ? '当前：完整模式' : '当前：关键行模式　<a href="?days=' 
 <p style="margin-top:22px"><a href="/">← 返回首页</a></p>
 <script>
 const DATA = ${payload};
-const WD = {Sun:'\u5468\u65e5',Mon:'\u5468\u4e00',Tue:'\u5468\u4e8c',Wed:'\u5468\u4e09',Thu:'\u5468\u56db',Fri:'\u5468\u4e94',Sat:'\u5468\u516d'};
+const WD = {Sun:'周日',Mon:'周一',Tue:'周二',Wed:'周三',Thu:'周四',Fri:'周五',Sat:'周六'};
 const FMT = {};
 function fmt(ms, tz) {
   let f = FMT[tz];
@@ -1547,11 +1516,11 @@ function fmt(ms, tz) {
     FMT[tz] = f;
   }
   const p = f.formatToParts(new Date(ms));
-  const g = t => (p.find(x => x.type === t) || {}).value || '';
+  const g = function (t) { const x = p.find(function (y) { return y.type === t; }); return x ? x.value : ''; };
   return g('month') + '-' + g('day') + ' ' + (WD[g('weekday')] || g('weekday')) + ' ' + g('hour') + ':' + g('minute');
 }
 const rows = DATA.rows;
-document.getElementById('cnt').textContent = (DATA.full ? '\u5168\u90e8 ' : '\u5173\u952e\u884c ') + rows.length + ' \u6761';
+document.getElementById('cnt').textContent = (DATA.full ? '全部 ' : '关键行 ') + rows.length + ' 条';
 document.getElementById('gen').textContent = fmt(Date.now(), 'Asia/Shanghai');
 const byDay = {};
 rows.forEach(function (r) {
@@ -1561,13 +1530,13 @@ rows.forEach(function (r) {
 let html = '';
 Object.keys(byDay).sort().forEach(function (k) {
   const list = byDay[k];
-  html += '<h2>' + k + '\u3000<span class="sub">' + list.length + ' \u6b21</span></h2>';
-  html += '<table><tr><th>\u7c7b\u578b</th><th>\u5317\u4eac\u65f6\u95f4</th><th>\u4f26\u6566(\u5e03\u4f26\u7279\u57fa\u51c6)</th>'
-        + '<th>\u82a5\u52a0\u54e5(WTI\u57fa\u51c6)</th><th>\u76f8\u4f4d</th><th>\u5e03\u4f26\u7279</th><th>WTI</th>'
-        + '<th>\u5e03\u4f26\u7279\u4ea4\u6613\u65e5</th><th>WTI\u4ea4\u6613\u65e5</th></tr>';
+  html += '<h2>' + k + '　<span class="sub">' + list.length + ' 次</span></h2>';
+  html += '<table><tr><th>类型</th><th>北京时间</th><th>伦敦(布伦特基准)</th>'
+        + '<th>芝加哥(WTI基准)</th><th>相位</th><th>布伦特</th><th>WTI</th>'
+        + '<th>布伦特交易日</th><th>WTI交易日</th></tr>';
   list.forEach(function (r) {
-    const key = (r.brent === '\u2605\u6536\u76d8' || r.wti === '\u2605\u6536\u76d8') ? ' class="keyline"' : '';
-    const tc = r.tag === '\u6536\u76d8' ? '#dc2626' : r.tag === '\u5f00\u76d8' ? '#16a34a' : '#64748b';
+    const key = (r.brent === '★收盘' || r.wti === '★收盘') ? ' class="keyline"' : '';
+    const tc = r.tag === '收盘' ? '#dc2626' : r.tag === '开盘' ? '#16a34a' : '#64748b';
     html += '<tr' + key + '>'
       + '<td style="color:' + tc + ';font-weight:600">' + (r.tag || '') + '</td>'
       + '<td>' + fmt(r.t, 'Asia/Shanghai') + '</td>'
@@ -1581,121 +1550,6 @@ Object.keys(byDay).sort().forEach(function (k) {
   });
   html += '</table>';
 });
-document.getElementById('out').innerHTML = html || '<p>\u672a\u6765 ' + DATA.days + ' \u5929\u6ca1\u6709\u4efb\u4f55\u89e6\u53d1\u3002</p>';
+document.getElementById('out').innerHTML = html || '<p>未来 ' + DATA.days + ' 天没有任何触发。</p>';
 </script></body></html>`;
-}
-
-// ============================================================
-// 排班预演（v8 新增 · 纯只读诊断，不属于业务逻辑）
-// ------------------------------------------------------------
-// 作用：把未来 N 天 cron 会触发的每一次抓取，用【已有的那套闸门函数】
-//       原样推演一遍，输出成表格，方便部署后当场核对，不用等一周、不用翻日志。
-//
-// ⚠️ 安全性声明（这几点是本功能能被放心加上去的前提）：
-//   · 纯函数：只做日期算术 + 调用 isBrentTrading / isBrentClosing /
-//     isWtiTrading / isWtiClosing / cronPhase / tradingDateString /
-//     wtiTradingDateString —— 这些都是上面已有的纯函数，一个字符都没改
-//   · 不读 KV、不写 KV（完全不碰 env.OIL_KV）
-//   · 不发起任何外部请求（不调 fetch、不碰 OilPriceAPI 配额）
-//   · 不触发任何抓取（不调 fetchAndSave / fetchGoldAndSave / fetchCnOilAll）
-//   · 不影响 scheduled() 定时任务的任何一行
-//   · 不修改任何已有变量或已有函数
-//   · 默认 404 隐身：无密钥时返回 ghost()，路径不对外暴露
-//
-// 因此：加这个功能 = 加了一个「只读的说明书」，抓取行为与历史数据零变化。
-// ============================================================
-
-/**
- * 推演未来 days 天的 cron 触发表。
- * cron 为 "5,20 * * * *"，故每小时两个候选时刻：UTC :05 与 :20。
- * @returns {Array} 每次触发的明细
- */
-function previewSchedule(days = 7, keyOnly = true) {
-  const now = new Date();
-  let base = new Date(now);
-  base.setUTCSeconds(0, 0);
-  base.setUTCMinutes(0, 0);
-  const total = days * 24;
-
-  // ---- 第一轮：只做闸门判定，不做任何字符串格式化 ----
-  // 判定时钟（londonParts / chicagoParts）内部已复用缓存的 formatter，很便宜；
-  // 真正贵的（交易日换算 + 三地时间字符串）留到第二轮只给保留行做，
-  // 这样 7 天 336 次循环里绝大部分只需跑两次 formatToParts。
-  const hits = [];
-  for (let i = 0; i < total; i++) {
-    const h = new Date(base.getTime() + i * 3600000);
-    for (const m of [5, 20]) {
-      const d = new Date(h.getTime() + m * 60000);
-      const ph = cronPhase(d);
-      // 与 scheduled() 完全相同的判定式 —— 保证预演 == 实际行为
-      const bOpen  = ph === 'open'  && isBrentTrading(d);
-      const wOpen  = ph === 'open'  && isWtiTrading(d);
-      const bClose = ph === 'close' && isBrentClosing(d);
-      const wClose = ph === 'close' && isWtiClosing(d);
-      if (!(bOpen || wOpen || bClose || wClose)) continue;
-      hits.push({
-        d,
-        phase: ph === 'open' ? ':05 盘中' : ':20 收盘',
-        brent: bClose ? '★收盘' : bOpen ? '盘中' : '不记',
-        wti:   wClose ? '★收盘' : wOpen ? '盘中' : '不记',
-      });
-    }
-  }
-
-  // ---- 第二轮：筛选出需要展示的行 ----
-  let kept = hits;
-  if (keyOnly) {
-    // 只保留真正需要核对的行，既省 CPU 又更聚焦：
-    //  · ★收盘（任一品种）
-    //  · 开盘首抓（某品种由「不记」翻转为「盘中」的那一行）
-    //  · 周末边界（伦敦或芝加哥落在周六/周日，用来确认确实没抓）
-    const out = [];
-    let prevB = null, prevW = null;
-    for (const r of hits) {
-      const bOn = r.brent !== '不记';
-      const wOn = r.wti !== '不记';
-      const isClose = r.brent === '★收盘' || r.wti === '★收盘';
-      const isOpen  = (bOn && !prevB) || (wOn && !prevW);
-      // 周末判定用低价方式：直接看星期，不做完整格式化
-      const lp = londonParts(r.d), cp = chicagoParts(r.d);
-      const isWeekend = lp.wd === 0 || lp.wd === 6 || cp.wd === 0 || cp.wd === 6;
-      if (isClose || isOpen || isWeekend) {
-        r.tag = isClose ? '收盘' : isOpen ? '开盘' : '周末';
-        out.push(r);
-      }
-      prevB = bOn; prevW = wOn;
-    }
-    kept = out;
-  }
-
-  // ---- 第三轮：只算交易日，不做任何「显示用」的时间格式化 ----
-  // ⚠️ 重要：三地时间字符串（北京/伦敦/芝加哥）一律【不在 Worker 里格式化】。
-  //   首次创建带 timeZone 的 Intl.DateTimeFormat 要加载 ICU 时区数据，
-  //   一个就要好几 ms，预演页碰 5~7 个就直接触发 Error 1102
-  //   （"Worker exceeded resource limits"）。
-  //   所以这里只吐毫秒时间戳，交给页面里的浏览器端 JS 去渲染 —— 浏览器
-  //   做这个零成本，Worker 的 CPU 占用压到最低。
-  return kept.map(r => ({
-    t: r.d.getTime(),          // 毫秒时间戳，浏览器端格式化
-    phase: r.phase,
-    brent: r.brent,
-    wti: r.wti,
-    brentDay: tradingDateString(r.d),
-    wtiDay: wtiTradingDateString(r.d),
-    tag: r.tag || '',
-  }));
-}
-
-/** 把某时刻格式化成指定时区的 "MM-DD 周X HH:MM" */
-function fmtTz(d, tz) {
-  try {
-    const wd = dtf('en-GB', { timeZone: tz, weekday: 'short' })
-      .format(d).toLowerCase().slice(0, 3);
-    const md = dtf('en-CA', { timeZone: tz, month: '2-digit', day: '2-digit' }).format(d);
-    const hm = dtf('en-GB', { timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
-    const map = { sun: '周日', mon: '周一', tue: '周二', wed: '周三', thu: '周四', fri: '周五', sat: '周六' };
-    return `${md} ${map[wd] || wd} ${hm}`;
-  } catch (e) {
-    return 'n/a';
-  }
 }
