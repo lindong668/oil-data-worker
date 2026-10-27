@@ -6,7 +6,7 @@
  *     并在 /update、/data、首页展示，能区分「没抓到」与「抓到了但源未刷新」。
  *  2. 黄金：★ B8 三源 xaus(主)→biquote(备)→gold-api(兜底)，循环 2 轮，每 3 分钟抓取
  *     （专用 cron，每 3 分钟；受 KV 免费版 1,000 次/天写入配额限制，不能每分钟）；
- *     且当天定时任务已抓过就直接跳过，保护 MetalpriceAPI 月度配额。
+ *     三源均无 key、无限流，因此不再需要"每天只抓一次"的配额保护。
  *  3. 所有响应加 Cache-Control: no-store，避免中间缓存导致「点了没真发出去」。
  *
  * v3 改动：布伦特交易时段闸门（以伦敦本地时间判断，周六休市整天不抓）
@@ -25,8 +25,10 @@
  *  3. 【新增 /clear-history】一键清空历史重来（?confirm=1 执行）。
  *     清理入口也顺带删除残留的 brent_history_marker。
  *
- * 当前保留的数据源：OilPriceAPI（原油实时）、MetalpriceAPI（黄金）、
+ * 当前保留的数据源：OilPriceAPI（原油）、xaus.com / biquote.io /
+ *                    api.gold-api.com（黄金三源）、
  *                    ShowAPI 138-46（国内油价，与已删除的 1108 无关）
+ *                    （MetalpriceAPI 已彻底移除，仅存于下方变更历史）
  *
  * v7 改动：新增 ACCESS_KEY 私有密钥（防止公网刷爆 API 配额）
  *
@@ -528,6 +530,13 @@ export default {
 
       const oilUTC = o?.timestamp ? new Date(o.timestamp).toISOString() : '';
       const oilAsOf = o?.asOf ? new Date(o.asOf).toISOString() : '';
+      /* 数据源代号 -> 看板显示名（MetalpriceAPI 早已废弃，勿再出现） */
+      const goldSrcName = (c) => ({
+        xaus: 'xaus.com（主）',
+        biquote: 'biquote.io（备用 · 券商实时链路）',
+        'gold-api': 'api.gold-api.com（兜底）',
+      })[c] || (c || '—');
+
       const goldUTC = g?.updatedAt || '';
       const cnUTC = cn?.updatedAt || '';
       const displayUTC = oilAsOf || oilUTC || goldUTC || cnUTC;
@@ -550,11 +559,11 @@ export default {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>国际原油 & 黄金 & 国内油价 · 每日参考价</title>
+<title>国际原油 & 黄金 & 国内油价 · 数据看板</title>
 <meta name="description" content="布伦特原油 $${pricePerBarrel || '—'} USD/桶，国际黄金 $${g?.priceUsdPerOz || '—'} USD/盎司，国内成品油各省指导价">
 </head>
 <body style="font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 20px">
-<h1>📊 国际原油 & 黄金 · 每日参考价</h1>
+<h1>📊 国际原油 & 黄金 · 数据看板</h1>
 
 ${o ? `
 <h2 style="margin-top:32px">🛢️ 布伦特原油</h2>
@@ -583,12 +592,14 @@ ${wtiCached && wtiCached.price != null ? `
 
 ${g ? `
 <h2 style="margin-top:32px">🪙 国际黄金（XAU/USD）</h2>
-<p><strong>📅 每日参考价（延迟日更，非盘中实时）</strong></p>
+<p><strong>⚡ 现货参考价（每 3 分钟采集，三源互为备用）</strong></p>
 <table style="width:100%;border-collapse:collapse;margin:20px 0">
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">每盎司价格</td><td style="padding:8px 0">$${g.priceUsdPerOz} USD/盎司</td></tr>
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">每克价格</td><td style="padding:8px 0">≈ ¥${g.priceCnyPerGram} / 克</td></tr>
-<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">数据源</td><td style="padding:8px 0">MetalpriceAPI 免费档（延迟约24h）</td></tr>
-<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">源数据日期</td><td style="padding:8px 0">${goldUTC} <span style="font-size:12px;color:#999">(UTC)</span></td></tr>
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">本次命中数据源</td><td style="padding:8px 0">${goldSrcName(g.fetchedFrom)}${g.stale === true ? ' <span style="color:#c0392b">（上游未刷新，沿用值）</span>' : ' <span style="color:#27ae60">（新值）</span>'}</td></tr>
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">备用链路</td><td style="padding:8px 0">xaus → biquote → gold-api，失败后循环重试 2 轮</td></tr>
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">源观测时间 as_of</td><td style="padding:8px 0">${goldUTC} <span style="font-size:12px;color:#999">(UTC)</span></td></tr>
+<tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">本次采集时刻</td><td style="padding:8px 0">${g.fetchedLocal || '—'} <span style="font-size:12px;color:#999">(北京时间)</span></td></tr>
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">上次价格 / 是否变化</td><td style="padding:8px 0">${g.prevPriceUsdPerOz ?? '—'} / ${g.changed === null ? '—' : (g.changed ? '有变化' : '无变化')}</td></tr>
 </table>
 <p style="font-size:12px;color:#999">ℹ️ 黄金每 3 分钟自动抓取一次（专用 cron "*/3"，与原油的 "5,20" 分开）；三源均无 key、无限流，按序 xaus → biquote → gold-api，失败后循环重试 2 轮。实时跳动由 2 号前端在浏览器直连 biquote 完成，本层为兜底与首屏。</p>` : ''}
@@ -610,7 +621,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
 </table>` : ''}
 
 <p style="font-size:14px;color:#666">🕐 你的本地时间：<span id="localTime"></span> <span style="font-size:12px;color:#999" id="tz"></span></p>
-<p style="font-size:12px;color:#aaa">以上为国际原料与成品油参考价，非零售汽油价 / 首饰金价。黄金为现货参考价，每小时更新，不代表柜台成交价。</p>
+<p style="font-size:12px;color:#aaa">以上为国际原料与成品油参考价，非零售汽油价 / 首饰金价。黄金为现货参考价，每 3 分钟采集一次，不代表柜台成交价。</p>
 <p style="font-size:12px;color:#aaa"><a href="https://xaus.com" target="_blank" rel="noopener">Gold data: XAUS</a> · <a href="/update${keyQS}">手动刷新</a> · <a href="/history${keyQS}">📈 布伦特走势</a> · <a href="/history?code=wti${keyQS.replace('?', '&')}">📈 WTI走势</a> · <a href="/data${keyQS}">原始JSON</a></p>
 
 <script>
@@ -1206,12 +1217,14 @@ async function recordDailyHistory(env, { price, isClosing, kvKey = 'brent_histor
   return data;
 }
 
-// ================= 黄金（免费档日更，配额极珍贵）=================
+// ================= 黄金（三源互为备用，均无 key 无限流）=================
 // ============================================================
 // ★ B7：黄金换源 —— xaus.com（主，无 key）/ api.gold-api.com（备，无 key）
 //   原 metalpriceapi 免费层本身是延迟数据，且每天只能抓 1 次保护配额。
 //   两个新源均【无 key、无注册、无强制限流】，因此每日闸门可以拆掉，
 //   黄金改为跟原油一样每小时刷新。
+// ★ B8：再加 biquote.io 作第二源（券商 MT5，与另两源不同链路），
+//   并把频率提到每 3 分钟（专用 cron "*/3"）。
 // ------------------------------------------------------------
 const XAUS_URL = 'https://xaus.com/api/v1/spot';
 const GOLDAPI_URL = 'https://api.gold-api.com/price/XAU';
