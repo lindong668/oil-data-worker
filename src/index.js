@@ -921,15 +921,37 @@ ${histDetail}
      * 现货黄金 XAU/USD 周日 22:00 UTC 至周五 21:00 UTC 近乎全天连续交易。
      */
     const min = now.getUTCMinutes();
-    if (min % 3 === 0) {
+
+    /* ★★ B9 关键修复：先分清【是哪条 cron 唤醒的】，再决定跑什么。
+     *
+     * B8 加了第二条 cron（"*/3" 专跑黄金），但两条共用同一个 scheduled()，
+     * 而函数里没有任何分流 —— 于是 "*/3" 每次唤醒也把原油整套逻辑跑了一遍：
+     *   ① 原油被多抓（本该只在 :05 / :20），配额白白消耗；
+     *   ② 更糟的是 cronPhase() = getUTCMinutes() < 10 ? 'open' : 'close'，
+     *      这套判断是 B7 专为 5(open) / 20(close) 设计的，"*/3" 带来的
+     *      12 / 15 / 18 等分钟会落进 'close' 分支，
+     *      把盘中价当收盘价记进历史走势 —— 历史曲线被污染。
+     *
+     * 分流依据：
+     *   首选 controller.cron（Cloudflare 回传本次触发的表达式）。
+     *   兜底用分钟数 —— "5,20" 的两个值都不是 3 的倍数，
+     *   "*/3" 的全部取值都是 3 的倍数，两个集合完全不重叠，
+     *   故 min % 3 能 100% 分开，不会误判。
+     */
+    const cronSpec = (controller && controller.cron) ? String(controller.cron) : '';
+    const isGoldTick = cronSpec
+      ? cronSpec.indexOf('*/3') !== -1          // 明确来自黄金那条
+      : (min % 3 === 0);                        // 兜底：按分钟分流
+
+    if (isGoldTick) {
       jobs.push(fetchGoldAndSave(env, { manual: false }));
       console.log(`[cron] 黄金抓取 — 北京 ${h}:${String(min).padStart(2, '0')}，每 3 分钟一次`);
+      if (!jobs.length) return;
+      await Promise.allSettled(jobs);
+      return;                                    // ★ 只跑黄金，绝不碰原油
     }
 
-    /* ★ 下面原油 + 国内油价：与 B7 逐行一致，不加任何分钟判断。
-     *   它们由 cron "5,20 * * * *" 唤醒，时刻选择交给 cron 自己，
-     *   避免在代码里用 min === 5 / === 20 判断 —— Cloudflare cron
-     *   偶有数秒漂移，一旦分钟数对不上就会整点漏抓。 */
+    /* ★ 下面原油 + 国内油价：只在 "5,20" 这条 cron 上执行，与 B7 逐行一致。 */
 
     // 国内油价：每天 08:00 那小时的 :05 / :20（万维易源 7-8 点更新后再拉）
     if (h === 8) jobs.push(fetchCnOilAll(env));
