@@ -4,7 +4,8 @@
  * v2 改动（针对「手动刷新拉不到新数据」问题）：
  *  1. 原油：抓取时一并记录 stale（沿用值标记）与 as_of（源观测时间），
  *     并在 /update、/data、首页展示，能区分「没抓到」与「抓到了但源未刷新」。
- *  2. 黄金：★ B8 三源 xaus(主)→biquote(备)→gold-api(兜底)，循环 2 轮，每分钟抓取；
+ *  2. 黄金：★ B8 三源 xaus(主)→biquote(备)→gold-api(兜底)，循环 2 轮，每 3 分钟抓取
+ *     （专用 cron，每 3 分钟；受 KV 免费版 1,000 次/天写入配额限制，不能每分钟）；
  *     且当天定时任务已抓过就直接跳过，保护 MetalpriceAPI 月度配额。
  *  3. 所有响应加 Cache-Control: no-store，避免中间缓存导致「点了没真发出去」。
  *
@@ -590,7 +591,7 @@ ${g ? `
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">源数据日期</td><td style="padding:8px 0">${goldUTC} <span style="font-size:12px;color:#999">(UTC)</span></td></tr>
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">上次价格 / 是否变化</td><td style="padding:8px 0">${g.prevPriceUsdPerOz ?? '—'} / ${g.changed === null ? '—' : (g.changed ? '有变化' : '无变化')}</td></tr>
 </table>
-<p style="font-size:12px;color:#999">ℹ️ 黄金每小时自动抓取一次（与原油同频）；源为 XAUS，无 key 无限流，三源按序 xaus → biquote → gold-api，循环 2 轮。</p>` : ''}
+<p style="font-size:12px;color:#999">ℹ️ 黄金每 3 分钟自动抓取一次（专用 cron "*/3"，与原油的 "5,20" 分开）；三源均无 key、无限流，按序 xaus → biquote → gold-api，失败后循环重试 2 轮。实时跳动由 2 号前端在浏览器直连 biquote 完成，本层为兜底与首屏。</p>` : ''}
 
 ${cn && cn.list && cn.list.length ? `
 <h2 style="margin-top:32px">🇨🇳 国内成品油指导价</h2>
@@ -711,7 +712,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
           from: gold.fetchedFrom,
           stale: gold.stale,
           fetchedLocal: gold.fetchedLocal,
-          note: 'B8 起黄金每分钟抓取（cron 每分钟），三源 xaus→biquote→gold-api 循环 2 轮',
+          note: 'B8 起黄金每 3 分钟抓取（专用 cron "*/3"，与原油 "5,20" 分开），三源 xaus→biquote→gold-api 循环 2 轮',
         } : null,
         cnOilFetchMarker: cnMarker || null,
         // 布伦特历史走势（自建累积：cron 抓取时顺便记录，零额外额度）
@@ -895,32 +896,39 @@ ${histDetail}
     const h = beijingHour(now);   // 北京时间小时（cron 整点触发，必为整数）
     const jobs = [];
 
-    // ★ B8：黄金改为每分钟抓取（三个源均无 key、无限流，可以放开）。
-    // 现货黄金 XAU/USD 周日 22:00 UTC 至周五 21:00 UTC 近乎全天连续交易。
-    // 这一层是 2 号前端的兜底数据源，越新越好。
+    /* ★ B8：黄金由专用 cron（每 3 分钟一次）唤醒，与原油的 "5,20" 分开。
+     *
+     * 为什么不是每分钟 —— 受 KV 写入配额限制，不是源的限制：
+     *   Workers KV 免费版每天只允许 1,000 次写入。
+     *   黄金每抓成功一次就写一次 gold_data，每分钟 = 1,440 次/天，
+     *   会在当天下午把配额耗光，之后写入报错、首屏数字静默冻住。
+     *   每 3 分钟 = 480 次/天，配合原油约 25 次，留有一倍余量。
+     *
+     * 3 号这一层是兜底 + 首屏，真正的实时跳动由 2 号前端在浏览器里
+     * 直连 biquote 完成，兜底旧 3 分钟没有可感知差别。
+     *
+     * 现货黄金 XAU/USD 周日 22:00 UTC 至周五 21:00 UTC 近乎全天连续交易。
+     */
     const min = now.getUTCMinutes();
-    jobs.push(fetchGoldAndSave(env, { manual: false }));
-    console.log(`[cron] 黄金抓取 — 北京 ${h}:${String(min).padStart(2, '0')}，每分钟一次`);
+    if (min % 3 === 0) {
+      jobs.push(fetchGoldAndSave(env, { manual: false }));
+      console.log(`[cron] 黄金抓取 — 北京 ${h}:${String(min).padStart(2, '0')}，每 3 分钟一次`);
+    }
 
-    /* ★ B8 关键：给原油 + 国内油价加【分钟相位锁】
-     *
-     * cron 从 "5,20 * * * *" 改成 "* * * * *" 后，如果不管，
-     * 下面这两块会每分钟都被触发 —— 原油 50 次/天、万维易源 100 次/天
-     * 会在几小时内直接打爆。
-     *
-     * 所以这里锁死：只有分钟等于 5 或 20 时才走原油/国内油价逻辑，
-     * 与 B7 及之前的行为【完全一致】—— 触发相位、次数、配额消耗都不变。 */
-    const isOilPhase = (min === 5 || min === 20);
+    /* ★ 下面原油 + 国内油价：与 B7 逐行一致，不加任何分钟判断。
+     *   它们由 cron "5,20 * * * *" 唤醒，时刻选择交给 cron 自己，
+     *   避免在代码里用 min === 5 / === 20 判断 —— Cloudflare cron
+     *   偶有数秒漂移，一旦分钟数对不上就会整点漏抓。 */
 
     // 国内油价：每天 08:00 那小时的 :05 / :20（万维易源 7-8 点更新后再拉）
-    if (h === 8 && isOilPhase) jobs.push(fetchCnOilAll(env));
+    if (h === 8) jobs.push(fetchCnOilAll(env));
 
     // 原油：布伦特与 WTI 各自判断，任一在交易/收盘窗口就抓（一次请求带回两个价）
     const ph = cronPhase(now);
-    const bOpen = isOilPhase && ph === 'open' && isBrentTrading(now);
-    const wOpen = isOilPhase && ph === 'open' && isWtiTrading(now);
-    const bClose = isOilPhase && ph === 'close' && isBrentClosing(now);
-    const wClose = isOilPhase && ph === 'close' && isWtiClosing(now);
+    const bOpen = ph === 'open' && isBrentTrading(now);
+    const wOpen = ph === 'open' && isWtiTrading(now);
+    const bClose = ph === 'close' && isBrentClosing(now);
+    const wClose = ph === 'close' && isWtiClosing(now);
 
     if (bOpen || wOpen || bClose || wClose) {
       const rec = { brent: bOpen || bClose, wti: wOpen || wClose };
@@ -1365,7 +1373,17 @@ async function fetchGoldAndSave(env, { manual = false, bootstrap = false } = {})
     changed: cached ? cached.priceUsdPerOz !== got.usdPerOz : null,
   };
 
-  await env.OIL_KV.put('gold_data', JSON.stringify(gold), { expirationTtl: 86400 * 2 });
+  /* KV 写入单独兜一层：万一撞上免费版 1,000 次/天的写入配额，
+   * 不能让"写不进去"变成"这次抓取整个失败"——
+   * 价已经拿到了，照样返回，只是标注 persisted=false 便于排查。 */
+  let persisted = true;
+  try {
+    await env.OIL_KV.put('gold_data', JSON.stringify(gold), { expirationTtl: 86400 * 2 });
+  } catch (e) {
+    persisted = false;
+    console.log(`[gold] KV 写入失败（可能已超每日配额）: ${e.message}`);
+  }
+  gold.persisted = persisted;
   return { data: gold, prev: cached, skipped: false };
 }
 
