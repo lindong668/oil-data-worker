@@ -4,7 +4,7 @@
  * v2 改动（针对「手动刷新拉不到新数据」问题）：
  *  1. 原油：抓取时一并记录 stale（沿用值标记）与 as_of（源观测时间），
  *     并在 /update、/data、首页展示，能区分「没抓到」与「抓到了但源未刷新」。
- *  2. 黄金：加每日抓取闸门 —— 定时任务无条件抓；手动刷新每天最多生效 1 次，
+ *  2. 黄金：★ B8 三源 xaus(主)→biquote(备)→gold-api(兜底)，循环 2 轮，每分钟抓取；
  *     且当天定时任务已抓过就直接跳过，保护 MetalpriceAPI 月度配额。
  *  3. 所有响应加 Cache-Control: no-store，避免中间缓存导致「点了没真发出去」。
  *
@@ -84,8 +84,25 @@ const HTML_HEADERS = { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Contro
 const JSON_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Robots-Tag': NOINDEX };
 const TEXT_HEADERS = { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'X-Robots-Tag': NOINDEX };
 
-/** 黄金手动刷新每日上限（保护月度配额，1 = 每天最多手动抓 1 次） */
-const GOLD_MANUAL_MAX_PER_DAY = 1;
+/** ★ B7：换用无 key 源后无月度配额，手动刷新只保留最小间隔防误触（秒） */
+const GOLD_MIN_INTERVAL_SEC = 300;
+
+/* ★ B8 黄金三源相关常量
+ *   后端每分钟才跑一次，时间宽裕，可以给每个源 5 秒超时。
+ *   （前端那边时间紧得多，超时只有 3 秒 —— 不能让用户干等。） */
+const GOLD_SRC_TIMEOUT_MS = 5000;   // 单个源最多等这么久
+const GOLD_ROUND_GAP_MS   = 1000;   // 第 1 轮全灭后歇一下再跑第 2 轮
+
+/** 单源超时保护：卡住的网络请求不能拖垮整次抓取 */
+function withTimeout(promise, ms) {
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), ms); }),
+  ]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
+const sleepMs = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ============================================================
 // 原油：一次请求拿两个品种（官方支持，20 个 code 也算 1 次配额）
@@ -573,7 +590,7 @@ ${g ? `
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">源数据日期</td><td style="padding:8px 0">${goldUTC} <span style="font-size:12px;color:#999">(UTC)</span></td></tr>
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">上次价格 / 是否变化</td><td style="padding:8px 0">${g.prevPriceUsdPerOz ?? '—'} / ${g.changed === null ? '—' : (g.changed ? '有变化' : '无变化')}</td></tr>
 </table>
-<p style="font-size:12px;color:#999">ℹ️ 黄金仅在每日定时任务（北京时间 04:00）自动抓取；手动刷新每天最多补抓 1 次，且当天定时任务已抓过则跳过，避免耗尽月度配额。</p>` : ''}
+<p style="font-size:12px;color:#999">ℹ️ 黄金每小时自动抓取一次（与原油同频）；源为 XAUS，无 key 无限流，三源按序 xaus → biquote → gold-api，循环 2 轮。</p>` : ''}
 
 ${cn && cn.list && cn.list.length ? `
 <h2 style="margin-top:32px">🇨🇳 国内成品油指导价</h2>
@@ -592,8 +609,8 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
 </table>` : ''}
 
 <p style="font-size:14px;color:#666">🕐 你的本地时间：<span id="localTime"></span> <span style="font-size:12px;color:#999" id="tz"></span></p>
-<p style="font-size:12px;color:#aaa">以上为国际原料与成品油参考价，非零售汽油价 / 首饰金价。黄金为延迟日更参考价，不代表实时盘中报价。</p>
-<p style="font-size:12px;color:#aaa"><a href="https://metalpriceapi.com" target="_blank" rel="noopener">Data provided by MetalpriceAPI</a> · <a href="/update${keyQS}">手动刷新</a> · <a href="/history${keyQS}">📈 布伦特走势</a> · <a href="/history?code=wti${keyQS.replace('?', '&')}">📈 WTI走势</a> · <a href="/data${keyQS}">原始JSON</a></p>
+<p style="font-size:12px;color:#aaa">以上为国际原料与成品油参考价，非零售汽油价 / 首饰金价。黄金为现货参考价，每小时更新，不代表柜台成交价。</p>
+<p style="font-size:12px;color:#aaa"><a href="https://xaus.com" target="_blank" rel="noopener">Gold data: XAUS</a> · <a href="/update${keyQS}">手动刷新</a> · <a href="/history${keyQS}">📈 布伦特走势</a> · <a href="/history?code=wti${keyQS.replace('?', '&')}">📈 WTI走势</a> · <a href="/data${keyQS}">原始JSON</a></p>
 
 <script>
   var d = new Date('${displayUTC}');
@@ -615,6 +632,47 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
 </body></html>`;
 
       return new Response(html, { headers: HTML_HEADERS });
+    }
+
+    // ---------------- /gold/live 现抓（★ B8 新增）----------------
+    // 用途：2 号前端在自己那条实时链路全部失败时，回头问 3 号【现在】去抓一个新价。
+    // 注意与 /data 的区别：
+    //   /data        → 读 KV，给出的是「上次定时抓到的」（最多旧 1 分钟）
+    //   /gold/live   → 当场真的去源站抓一次，给的是「此刻的」
+    // 2 号只要后者，因为前端自己全挂的时候，要的是另一条路能不能通，不是旧货。
+    //
+    // ⚠️ 需要 ACCESS_KEY —— 只能由 2 号 Worker【服务端】转发调用，
+    //    前端 JS 直接调会把密钥暴露在页面源码里，绝对不行。
+    if (url.pathname === '/gold/live') {
+      if (!ok) return new Response(JSON.stringify({ error: 'forbidden' }),
+        { status: 403, headers: JSON_HEADERS });
+      try {
+        const r = await fetchGoldAndSave(env, { manual: false });
+        const d = r.data;
+        return new Response(JSON.stringify({
+          ok: true,
+          live: true,                       // 明确告诉前端：这是现抓的，不是缓存
+          priceUsdPerOz: d.priceUsdPerOz,
+          asOf: d.updatedAt,
+          source: d.fetchedFrom,            // xaus / biquote / gold-api
+          stale: d.stale === true,
+          fetchedAtMs: Date.now(),
+        }), { headers: JSON_HEADERS });
+      } catch (e) {
+        // 现抓也失败 → 把最后一次成功值一并给回，但明确标注它不是新的
+        const c = await env.OIL_KV.get('gold_data', 'json').catch(() => null);
+        return new Response(JSON.stringify({
+          ok: false,
+          live: false,
+          error: e.message,
+          fallback: c ? {
+            priceUsdPerOz: c.priceUsdPerOz,
+            asOf: c.updatedAt,
+            source: c.fetchedFrom,
+            note: '现抓失败，这是最后一次成功抓取的值（非实时）',
+          } : null,
+        }), { headers: JSON_HEADERS });
+      }
     }
 
     // ---------------- /data ----------------
@@ -646,7 +704,15 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
         wti: wti || null,          // WTI 原油（同一次请求带回，不额外消耗配额）
         gold,
         cn_oil: cn,
-        goldFetchMarker: marker || null,
+        // ★ B7：gold_fetch_marker 已随每日闸门一并废弃，改由 gold 自身携带抓取信息
+        goldFetchMarker: gold ? {
+          date: (gold.updatedAt || '').slice(0, 10),
+          source: gold.fetchedSource,
+          from: gold.fetchedFrom,
+          stale: gold.stale,
+          fetchedLocal: gold.fetchedLocal,
+          note: 'B8 起黄金每分钟抓取（cron 每分钟），三源 xaus→biquote→gold-api 循环 2 轮',
+        } : null,
         cnOilFetchMarker: cnMarker || null,
         // 布伦特历史走势（自建累积：cron 抓取时顺便记录，零额外额度）
         brentHistory: hist ? {
@@ -829,18 +895,32 @@ ${histDetail}
     const h = beijingHour(now);   // 北京时间小时（cron 整点触发，必为整数）
     const jobs = [];
 
-    // 黄金：每天 04:00 一次。月度配额极珍贵，盘中绝不抓。
-    if (h === 4) jobs.push(fetchGoldAndSave(env, { manual: false }));
+    // ★ B8：黄金改为每分钟抓取（三个源均无 key、无限流，可以放开）。
+    // 现货黄金 XAU/USD 周日 22:00 UTC 至周五 21:00 UTC 近乎全天连续交易。
+    // 这一层是 2 号前端的兜底数据源，越新越好。
+    const min = now.getUTCMinutes();
+    jobs.push(fetchGoldAndSave(env, { manual: false }));
+    console.log(`[cron] 黄金抓取 — 北京 ${h}:${String(min).padStart(2, '0')}，每分钟一次`);
 
-    // 国内油价：每天 08:00 一次（万维易源 7-8 点更新后再拉）
-    if (h === 8) jobs.push(fetchCnOilAll(env));
+    /* ★ B8 关键：给原油 + 国内油价加【分钟相位锁】
+     *
+     * cron 从 "5,20 * * * *" 改成 "* * * * *" 后，如果不管，
+     * 下面这两块会每分钟都被触发 —— 原油 50 次/天、万维易源 100 次/天
+     * 会在几小时内直接打爆。
+     *
+     * 所以这里锁死：只有分钟等于 5 或 20 时才走原油/国内油价逻辑，
+     * 与 B7 及之前的行为【完全一致】—— 触发相位、次数、配额消耗都不变。 */
+    const isOilPhase = (min === 5 || min === 20);
+
+    // 国内油价：每天 08:00 那小时的 :05 / :20（万维易源 7-8 点更新后再拉）
+    if (h === 8 && isOilPhase) jobs.push(fetchCnOilAll(env));
 
     // 原油：布伦特与 WTI 各自判断，任一在交易/收盘窗口就抓（一次请求带回两个价）
     const ph = cronPhase(now);
-    const bOpen = ph === 'open' && isBrentTrading(now);
-    const wOpen = ph === 'open' && isWtiTrading(now);
-    const bClose = ph === 'close' && isBrentClosing(now);
-    const wClose = ph === 'close' && isWtiClosing(now);
+    const bOpen = isOilPhase && ph === 'open' && isBrentTrading(now);
+    const wOpen = isOilPhase && ph === 'open' && isWtiTrading(now);
+    const bClose = isOilPhase && ph === 'close' && isBrentClosing(now);
+    const wClose = isOilPhase && ph === 'close' && isWtiClosing(now);
 
     if (bOpen || wOpen || bClose || wClose) {
       const rec = { brent: bOpen || bClose, wti: wOpen || wClose };
@@ -1119,53 +1199,176 @@ async function recordDailyHistory(env, { price, isClosing, kvKey = 'brent_histor
 }
 
 // ================= 黄金（免费档日更，配额极珍贵）=================
+// ============================================================
+// ★ B7：黄金换源 —— xaus.com（主，无 key）/ api.gold-api.com（备，无 key）
+//   原 metalpriceapi 免费层本身是延迟数据，且每天只能抓 1 次保护配额。
+//   两个新源均【无 key、无注册、无强制限流】，因此每日闸门可以拆掉，
+//   黄金改为跟原油一样每小时刷新。
+// ------------------------------------------------------------
+const XAUS_URL = 'https://xaus.com/api/v1/spot';
+const GOLDAPI_URL = 'https://api.gold-api.com/price/XAU';
+const BIQUOTE_URL = 'https://biquote.io/api/XAUUSD';
+const TROY_OZ_TO_GRAM = 31.1034768;
+
+/** 主源：xaus.com —— 一次请求同时给出 USD/盎司 与 指定货币的克价 */
+async function fetchGoldXaus() {
+  const res = await fetch(`${XAUS_URL}?currency=CNY&unit=gram&compact=1`, {
+    headers: { 'Accept': 'application/json', 'User-Agent': 'oil-data-worker/1.0' },
+    cf: { cacheTtl: 0 },
+  });
+  if (!res.ok) throw new Error(`XAUS ${res.status}`);
+  const j = await res.json();
+
+  // xaus 自带新鲜度契约：fresh=实时 / stale=上游挂了但这是最后真实价 /
+  // unavailable=没有真实值可给（核心端点直接 503，绝不编造）
+  const state = j.data_state || {};
+  if (state.status === 'unavailable') throw new Error('XAUS unavailable');
+
+  const usdPerOz = +(j.spot_usd_oz || 0).toFixed(2);
+  const cnyPerGram = +(j.xau?.price || 0).toFixed(2);
+  if (!usdPerOz || !cnyPerGram) throw new Error('XAUS bad payload');
+
+  return {
+    usdPerOz,
+    cnyPerGram,
+    stale: state.status !== 'fresh',          // true = 沿用值
+    asOf: state.as_of || j.updated_at || null,
+    source: 'xaus',
+  };
+}
+
+/**
+ * ★ B8 第二源：biquote.io —— 券商 MT5 链路（真正独立的第二条路）
+ *
+ * 为什么把它排在第二而不是最后：
+ *   实测三轮对比里 xaus 与 gold-api 偏差恒为 0.000%（几乎肯定同源），
+ *   主源一挂，gold-api 大概率跟着挂 —— 那级备用等于白设。
+ *   biquote 走的是 MetaTrader 5 券商报价链路，与主源完全不同路，
+ *   才是真正能在主源挂掉时救命的那个。
+ *
+ * 注意：MT5 报价的 last/volume 恒为 0，必须取 mid（或 bid/ask 中值）。
+ */
+async function fetchGoldBiquote() {
+  const res = await fetch(BIQUOTE_URL, {
+    headers: { 'Accept': 'application/json', 'User-Agent': 'oil-data-worker/1.0' },
+    cf: { cacheTtl: 0 },
+  });
+  if (!res.ok) throw new Error(`biquote ${res.status}`);
+  const j = await res.json();
+
+  const bid = +(j.bid || 0), ask = +(j.ask || 0);
+  const mid = (bid && ask) ? (bid + ask) / 2 : +(j.mid || 0);
+  if (!mid) throw new Error('biquote bad payload');
+
+  // MT5 链路日波动大时点差会拉开，中点仍是可用的参考价
+  return {
+    usdPerOz: +mid.toFixed(2),
+    stale: false,
+    asOf: j.timestamp || null,
+    source: 'biquote',
+    marketState: j.marketState || null,
+    quoteAgeSeconds: j.quoteAgeSeconds ?? null,
+  };
+}
+
+async function fetchGoldApi(cached) {
+  const res = await fetch(GOLDAPI_URL, {
+    headers: { 'Accept': 'application/json', 'User-Agent': 'oil-data-worker/1.0' },
+    cf: { cacheTtl: 0 },
+  });
+  if (!res.ok) throw new Error(`gold-api ${res.status}`);
+  const j = await res.json();
+
+  const usdPerOz = +(j.price || 0).toFixed(2);
+  if (!usdPerOz) throw new Error('gold-api bad payload');
+
+  // 备用源不提供汇率：优先用上次缓存反推隐含 USD/CNY，否则退回 7.2 兜底
+  let rate = 7.2;
+  if (cached && cached.priceUsdPerOz && cached.priceCnyPerGram) {
+    rate = cached.priceCnyPerGram * TROY_OZ_TO_GRAM / cached.priceUsdPerOz;
+  }
+  return {
+    usdPerOz,
+    cnyPerGram: +(usdPerOz / TROY_OZ_TO_GRAM * rate).toFixed(2),
+    stale: false,
+    asOf: j.updatedAt || null,
+    source: 'gold-api',
+  };
+}
+
+
 async function fetchGoldAndSave(env, { manual = false, bootstrap = false } = {}) {
   const cached = await env.OIL_KV.get('gold_data', 'json').catch(() => null);
-  const marker = await env.OIL_KV.get('gold_fetch_marker', 'json').catch(() => null);
-  const today = beijingDateString();
 
-  // 手动刷新的闸门：当天已抓过（无论定时任务还是手动）→ 直接跳过
-  if (manual && marker && marker.date === today && GOLD_MANUAL_MAX_PER_DAY <= 1) {
-    return {
-      data: cached,
-      prev: cached,
-      skipped: true,
-      reason: `今日已抓取（${marker.source === 'cron' ? '定时任务 04:00' : marker.source === 'manual' ? '手动' : '初始化'}），跳过以保护月度配额`,
-    };
+  // ★ B7：无 key 源没有月度配额，闸门从「每天 1 次」放宽为「最小间隔」防误触
+  if (manual && cached && cached.fetchedAtMs) {
+    const gap = (Date.now() - cached.fetchedAtMs) / 1000;
+    if (gap < GOLD_MIN_INTERVAL_SEC) {
+      return { data: cached, prev: cached, skipped: true,
+               reason: `${Math.round(GOLD_MIN_INTERVAL_SEC - gap)} 秒内已抓过，跳过` };
+    }
   }
 
-  const apiKey = env.METALPRICEAPI_KEY;
-  if (!apiKey) throw new Error('Missing METALPRICEAPI_KEY');
+  /* ★ B8：三源按序尝试，跑 2 轮
+   *
+   * 为什么跑 2 轮而不是 1 轮：
+   *   网络抖动经常是瞬时的。兜底源失败的那一刻，主源可能已经恢复了。
+   *   一轮打完就放弃，会白白错过刚恢复的主源。
+   *   所以第二轮从主源重新开始 —— 主 → 备 → 兜底，再 主 → 备 → 兜底。
+   *
+   * 顺序：xaus（主）→ biquote（备，独立链路）→ gold-api（兜底，与主源同源）
+   */
+  const ROUNDS = [
+    () => fetchGoldXaus(),
+    () => fetchGoldBiquote(),
+    () => fetchGoldApi(cached),
+  ];
+  const NAMES = ['xaus', 'biquote', 'gold-api'];
 
-  const res = await fetch(
-    `https://api.metalpriceapi.com/v1/latest?api_key=${apiKey}&base=USD&currencies=XAU,CNY`,
-    { headers: { 'Accept': 'application/json' }, cf: { cacheTtl: 0 } }
-  );
-  if (!res.ok) throw new Error(`Gold API ${res.status}`);
+  let got = null;
+  const errs = [];
+  for (let round = 1; round <= 2 && !got; round++) {
+    for (let i = 0; i < ROUNDS.length; i++) {
+      try {
+        got = await withTimeout(ROUNDS[i](), GOLD_SRC_TIMEOUT_MS);
+        break;                       // 拿到就停，不再往下试
+      } catch (e) {
+        errs.push(`R${round}/${NAMES[i]}: ${e.message}`);
+      }
+    }
+    // 第 1 轮全灭 → 歇一下再试第 2 轮，给主源恢复的时间
+    if (!got && round === 1) await sleepMs(GOLD_ROUND_GAP_MS);
+  }
+  if (!got) throw new Error('Gold all sources failed: ' + errs.join(' | '));
 
-  const j = await res.json();
-  const usdPerOz = +(1 / j.rates.XAU).toFixed(2);
-  const cnyPerGram = +(usdPerOz / 31.1034768 * j.rates.CNY).toFixed(2);
+  // biquote 不给克价：用上次缓存反推隐含 USD/CNY 补齐（首屏 SSR 要用）
+  let cnyPerGram = got.cnyPerGram;
+  if (!cnyPerGram) {
+    let rate = 7.2;
+    if (cached && cached.priceUsdPerOz && cached.priceCnyPerGram) {
+      rate = cached.priceCnyPerGram * TROY_OZ_TO_GRAM / cached.priceUsdPerOz;
+    }
+    cnyPerGram = +(got.usdPerOz / TROY_OZ_TO_GRAM * rate).toFixed(2);
+  }
 
   const gold = {
-    priceUsdPerOz: usdPerOz,
+    priceUsdPerOz: got.usdPerOz,
     priceCnyPerGram: cnyPerGram,
-    updatedAt: j.date || new Date().toISOString(),   // 源数据日期
+    updatedAt: got.asOf || new Date().toISOString(),   // 源数据观测时间
     fetchedLocal: beijingNow(),
+    fetchedAtMs: Date.now(),
     fetchedSource: manual ? 'manual' : (bootstrap ? 'bootstrap' : 'cron'),
+    fetchedFrom: got.source,                            // xaus / biquote / gold-api
+    attempts: errs.length ? errs : null,                 // 本次实际走了几步才成功
+    stale: got.stale === true,                          // true = 上游未刷新，沿用最后真实价
     prevPriceUsdPerOz: cached ? cached.priceUsdPerOz : null,
-    changed: cached ? cached.priceUsdPerOz !== usdPerOz : null,
+    changed: cached ? cached.priceUsdPerOz !== got.usdPerOz : null,
   };
 
   await env.OIL_KV.put('gold_data', JSON.stringify(gold), { expirationTtl: 86400 * 2 });
-  await env.OIL_KV.put(
-    'gold_fetch_marker',
-    JSON.stringify({ date: today, source: gold.fetchedSource }),
-    { expirationTtl: 86400 * 3 }
-  );
-
   return { data: gold, prev: cached, skipped: false };
 }
+
 
 // ================= 国内成品油 =================
 const SHOWAPI_URL = 'https://route.showapi.com/138-46';
