@@ -382,6 +382,77 @@ function isWtiClosing(d = new Date()) {
 }
 
 // ============================================================
+// 黄金（XAU/USD 现货）交易时段 —— 纽约时间为准
+// ------------------------------------------------------------
+// 国际现货黄金：周日纽约 18:00 开盘，周五纽约 17:00 周收盘，
+// 每天纽约 17:00-18:00 为结算时段（休市 1 小时），周六周日全程休市。
+// 换算成北京时间（夏令时）：早上 06:00 开盘，次日凌晨 05:00 收盘，
+// 每天 05:00-06:00 结算休市。
+// 美国 11 月进冬令时后整体延后 1 小时，代码用 America/New_York
+// 标准时区名，会自动跟随，不必改代码。
+// ============================================================
+
+// 解析纽约本地时间 → { wd: 0=周日..6=周六, hour: 0-23 }
+function newYorkParts(d = new Date()) {
+  try {
+    const parts = dtf('en-GB', {
+      timeZone: 'America/New_York', weekday: 'short', hour: '2-digit', hour12: false,
+    }).formatToParts(d);
+    const get = t => (parts.find(p => p.type === t) || {}).value || '';
+    const wd = ['sun','mon','tue','wed','thu','fri','sat'].indexOf(get('weekday').toLowerCase());
+    const hour = parseInt(get('hour'), 10);
+    if (wd >= 0 && !isNaN(hour)) return { wd, hour };
+  } catch (e) { /* 落到兜底 */ }
+  const n = new Date(d.getTime() - 5 * 3600 * 1000);
+  return { wd: n.getUTCDay(), hour: n.getUTCHours() };
+}
+
+// 纽约本地时间 HH:MM（仅用于日志与状态展示，方便你核对闸门行为）
+function newYorkClock(d = new Date()) {
+  try {
+    return dtf('en-GB', {
+      timeZone: 'America/New_York', weekday: 'short',
+      hour: '2-digit', minute: '2-digit', hour12: false,
+    }).format(d);
+  } catch (e) { return 'n/a'; }
+}
+
+// ★ 黄金市场状态：open=交易中 / settlement=每日结算 / weekend=周末休市
+// 这个函数同时给后台记录闸门用、也给前端显示「休市中」用，两处口径一致。
+function goldMarketState(d = new Date()) {
+  const { wd, hour } = newYorkParts(d);
+  if (wd === 6) return 'weekend';                    // 周六全天休市
+  if (wd === 0) return hour >= 18 ? 'open' : 'weekend'; // 周日 18:00 开盘
+  if (wd === 5) return hour < 17 ? 'open' : 'weekend';  // 周五 17:00 周收盘
+  if (hour === 17) return 'settlement';              // 周一~周四 每日结算 1 小时
+  return 'open';
+}
+
+// 是否处于黄金交易时段（只有 true 时才累积开高低收）
+function isGoldTrading(d = new Date()) {
+  return goldMarketState(d) === 'open';
+}
+
+// 黄金交易日 YYYY-MM-DD（以北京日期为基准，符合中文访客直觉）
+// 新交易日从北京 06:00 开始，所以北京 00:00-05:59 属于前一交易日。
+function goldTradingDateString(d = new Date()) {
+  const bj = beijingDateString(d);
+  const h = beijingHour(d);
+  if (h < 6) {
+    const dt = new Date(bj + 'T12:00:00Z');
+    dt.setUTCDate(dt.getUTCDate() - 1);
+    return dt.toISOString().slice(0, 10);
+  }
+  return bj;
+}
+
+// 该日期是否为黄金交易日（周一~周五）
+function isWeekdayForGold(day) {
+  const wd = new Date(day + 'T12:00:00Z').getUTCDay();
+  return wd >= 1 && wd <= 5;
+}
+
+// ============================================================
 // 通用「每天只抓一次」闸门
 // ------------------------------------------------------------
 // 规则（黄金 / 国内油价 / 历史日报 三处共用）：
@@ -689,7 +760,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
 
     // ---------------- /data ----------------
     if (url.pathname === '/data') {
-      const [oil, gold, cn, marker, hist, cnMarker, wti, wtiHist] = await Promise.all([
+      const [oil, gold, cn, marker, hist, cnMarker, wti, wtiHist, goldHist] = await Promise.all([
         env.OIL_KV.get('oil_data', 'json'),
         env.OIL_KV.get('gold_data', 'json'),
         env.OIL_KV.get('cn_oil_data', 'json'),
@@ -698,6 +769,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
         env.OIL_KV.get('cn_oil_fetch_marker', 'json'),
         env.OIL_KV.get('wti_data', 'json'),
         env.OIL_KV.get('wti_history', 'json'),
+        env.OIL_KV.get('gold_history', 'json'),
       ]);
       const now = new Date();
       return new Response(JSON.stringify({
@@ -710,6 +782,13 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
           chicagoClock: chicagoClock(now),
           brent: { trading: isBrentTrading(now), closing: isBrentClosing(now) },
           wti:   { trading: isWtiTrading(now),   closing: isWtiClosing(now) },
+          gold: {
+            state: goldMarketState(now),        // open=交易中 / settlement=每日结算 / weekend=周末休市
+            trading: isGoldTrading(now),
+            newYorkClock: newYorkClock(now),
+            tradingDay: goldTradingDateString(now),
+            today: gold && gold.today ? gold.today : null,
+          },
           note: 'cron "5,20 * * * *"：:05=盘中采样，:20=收盘补抓。两品种闸门独立，任一为真即调 API',
         },
         oil,
@@ -741,6 +820,15 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
           rows: wtiHist.rows?.length ?? 0,
           latest: wtiHist.rows?.[wtiHist.rows.length - 1] ?? null,
           note: '完整数组见 /history?code=wti 页面；数据来自本站自身抓取的实时价',
+        } : null,
+        // 黄金自建日线（每天收盘定格一条，只留最近 7 天）
+        goldHistory: goldHist ? {
+          mode: 'self-built',
+          updatedAt: goldHist.updatedAt,
+          rows: goldHist.rows?.length ?? 0,
+          latest: goldHist.rows?.[goldHist.rows.length - 1] ?? null,
+          data: goldHist.rows ?? [],
+          note: '数据来自本站自身每 3 分钟一次的实时抓取，收盘价取自结算前最后一次真实成交',
         } : null,
       }, null, 2), { headers: JSON_HEADERS });
     }
@@ -1253,6 +1341,90 @@ const GOLDAPI_URL = 'https://api.gold-api.com/price/XAU';
 const BIQUOTE_URL = 'https://biquote.io/api/XAUUSD';
 const TROY_OZ_TO_GRAM = 31.1034768;
 
+// ============================================================
+// 黄金自建日线（开/高/低/收）—— 与原油同一套思路
+// ------------------------------------------------------------
+// 一份数据两用：3 号每 3 分钟抓一次黄金，抓的同时顺手累积当日 OHLC，
+// 不额外消耗任何抓取额度。
+//
+//   · 当日第一次抓取   → open
+//   · 每次抓取         → 更新 high / low / close
+//   · 收盘前最后一次    → close 定格，写入 gold_history（每天仅此 1 次写入）
+//
+// ★ 收盘定格的判定办法（不写死钟点，自动跟随冬令时与周末）：
+//   本轮抓完后，看「下一次采集时刻」（当前 +3 分钟）是否还在交易时段。
+//   若下一次已休市，则本轮就是当日最后一次真实成交采样，close 就此定格。
+//   这样天然落在纽约 16:57 那一次，而不会误取结算时段里的沿用值。
+//
+// ★ 为什么只在收盘时写 gold_history：
+//   黄金每天抓 480 次，若每次都写历史 KV，加上 gold_data 的 480 次
+//   会逼近免费版 1,000 次/天的写入上限。只在定格时写 1 次，
+//   总配额约 508 次/天，安全。
+// ============================================================
+
+// 把当日 OHLC 写进 gold_history（只保留最近 7 天）
+async function appendGoldHistory(env, row) {
+  const h = await env.OIL_KV.get('gold_history', 'json').catch(() => null);
+  const rows = Array.isArray(h && h.rows) ? h.rows.slice() : [];
+  const item = {
+    day: row.day,
+    open: row.open,
+    high: row.high,
+    low: row.low,
+    close: row.close,
+    samples: row.samples || 0,
+    settled: true,
+  };
+  const i = rows.findIndex(r => r.day === row.day);
+  if (i >= 0) rows[i] = item; else rows.push(item);
+  rows.sort((a, b) => (a.day < b.day ? -1 : 1));
+  const trimmed = rows.slice(-7);
+  await env.OIL_KV.put('gold_history', JSON.stringify({
+    rows: trimmed,
+    updatedAt: new Date().toISOString(),
+  }));
+  return trimmed;
+}
+
+// 累积当日 OHLC（挂在 gold_data 上，随 gold_data 一起写入，零额外 KV 写入）
+async function recordGoldOhlc(env, gold, now = new Date()) {
+  const state = goldMarketState(now);
+  // 休市与每日结算时段不记 —— 此时接口返回的是沿用值，记进去会污染走势
+  if (state !== 'open') return gold;
+
+  const day = goldTradingDateString(now);
+  if (!isWeekdayForGold(day)) return gold;      // 周六周日不建记录
+
+  const price = Number(gold.priceUsdPerOz);
+  if (!Number.isFinite(price)) return gold;
+
+  let t = gold.today;
+  if (!t || t.day !== day) {
+    // 换日：先把上一天补记进去（万一昨天没走到定格那一步，不至于丢一天）
+    if (t && t.day !== day && !t.settled) {
+      await appendGoldHistory(env, t);
+    }
+    t = { day, open: price, high: price, low: price, close: price, samples: 1, settled: false };
+  } else {
+    t.high = Math.max(t.high, price);
+    t.low = Math.min(t.low, price);
+    t.close = price;
+    t.samples = (t.samples || 0) + 1;
+  }
+
+  // ★ 收盘定格：下一次采集已不在交易时段 → 本轮即当日最后一笔真实成交
+  const nextState = goldMarketState(new Date(now.getTime() + 3 * 60 * 1000));
+  if (!t.settled && nextState !== 'open') {
+    t.settled = true;
+    t.close = price;
+    t.settledAt = gold.updatedAt || new Date().toISOString();
+    await appendGoldHistory(env, t);
+  }
+
+  gold.today = t;
+  return gold;
+}
+
 /** 主源：xaus.com —— 一次请求同时给出 USD/盎司 与 指定货币的克价 */
 async function fetchGoldXaus() {
   const res = await fetch(`${XAUS_URL}?currency=CNY&unit=gram&compact=1`, {
@@ -1407,6 +1579,13 @@ async function fetchGoldAndSave(env, { manual = false, bootstrap = false } = {})
     prevPriceUsdPerOz: cached ? cached.priceUsdPerOz : null,
     changed: cached ? cached.priceUsdPerOz !== got.usdPerOz : null,
   };
+
+  // 顺手累积当日开高低收：休市不记，收盘那一次自动定格并写入 gold_history
+  try {
+    await recordGoldOhlc(env, gold);
+  } catch (e) {
+    console.log('[gold] OHLC 累积失败: ' + e.message);
+  }
 
   /* KV 写入单独兜一层：万一撞上免费版 1,000 次/天的写入配额，
    * 不能让"写不进去"变成"这次抓取整个失败"——
