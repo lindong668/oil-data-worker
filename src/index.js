@@ -124,132 +124,6 @@ const BRENT_CODE = 'BRENT_CRUDE_USD';
 const WTI_CODE = 'WTI_USD';
 const OIL_LATEST_BASE = 'https://api.oilpriceapi.com/v1/prices/latest';
 
-/* ============================================================
- * ★ B11：原油抓取改为【与 2 号同源的多源链路】
- * ------------------------------------------------------------
- * 背景：原用 OilPriceAPI（需 Token、有配额），实测出现过
- *   101.53（那其实是 WTI 的价）与 114.19（高出市场约 3%）这类偏离值，
- *   导致 3 号的收盘定格与 2 号实时链路对不上（110.70 vs 114.19）。
- * 现在改成与 2 号完全同源：biquote → yahoo → yahoo2 → stooq，
- *   OilPriceAPI 降级为最后兜底（仍可用，但不作为主源）。
- * 好处：2 号与 3 号取同一个市场价 → 定格值、报表天然一致。
- * ============================================================ */
-
-const OIL_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
-
-async function oilGetJson(u, ms = 3500, headers = {}) {
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), ms);
-  try {
-    const r = await fetch(u, {
-      signal: ac.signal,
-      cache: 'no-store',
-      headers: { Accept: 'application/json', 'User-Agent': OIL_UA, ...headers },
-    });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return await r.json();
-  } finally { clearTimeout(t); }
-}
-
-/* 源 1：biquote —— 券商 MT5 链路（2 号黄金在用，实测偏差 < 0.04%） */
-async function oilSrcBiquote() {
-  const [w, b] = await Promise.all([
-    oilGetJson('https://biquote.io/api/XTIUSD'),
-    oilGetJson('https://biquote.io/api/XBRUSD'),
-  ]);
-  const mid = (j) => {
-    const bid = Number(j && j.bid), ask = Number(j && j.ask);
-    if (bid && ask) return (bid + ask) / 2;
-    return Number(j && j.mid) || 0;
-  };
-  const wti = mid(w), brent = mid(b);
-  if (!wti && !brent) throw new Error('biquote 两个符号都没返回价');
-  return { brent, wti, provider: 'biquote', note: '券商 MT5 链路' };
-}
-
-/* 源 2：Yahoo Finance（2 号实测布伦特 111.91，与市场一致） */
-async function oilSrcYahoo(host) {
-  const one = async (sym) => {
-    const j = await oilGetJson(
-      `https://${host}/v8/finance/chart/${sym}?interval=1m&range=1d`, 3500);
-    const res = j && j.chart && j.chart.result && j.chart.result[0];
-    const meta = res && res.meta;
-    const p = Number(meta && (meta.regularMarketPrice || meta.previousClose));
-    if (!p) throw new Error('Yahoo ' + sym + ' 无价');
-    return p;
-  };
-  const [b, w] = await Promise.all([one('BZ=F'), one('CL=F')]);
-  return { brent: b, wti: w, provider: host === 'query1.finance.yahoo.com' ? 'yahoo' : 'yahoo2',
-           note: 'Yahoo Finance 期货' };
-}
-
-/* 源 4：Stooq 免费 CSV（无需 key） */
-async function oilSrcStooq() {
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), 3500);
-  try {
-    const r = await fetch('https://stooq.com/q/l/?s=cb.f+cl.f&f=sd2t2ohlcv&h&e=csv',
-      { signal: ac.signal, cache: 'no-store', headers: { 'User-Agent': OIL_UA } });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const txt = await r.text();
-    const rows = txt.trim().split('\n').slice(1);
-    let brent = 0, wti = 0;
-    for (const line of rows) {
-      const c = line.split(',');
-      const sym = (c[0] || '').toUpperCase();
-      const close = Number(c[6]);
-      if (!close) continue;
-      if (sym.includes('CB.F')) brent = close;
-      if (sym.includes('CL.F')) wti = close;
-    }
-    if (!brent && !wti) throw new Error('Stooq 未解析出价');
-    return { brent, wti, provider: 'stooq', note: 'Stooq 免费 CSV' };
-  } finally { clearTimeout(t); }
-}
-
-/* 兜底：OilPriceAPI（保留原逻辑，仅在主源全挂时使用） */
-async function oilSrcOilPriceApi(apiKey) {
-  if (!apiKey) throw new Error('Missing OILPRICEAPI_KEY');
-  const headers = { 'Authorization': `Token ${apiKey}` };
-  const res = await fetch(`${OIL_LATEST_BASE}?by_code=${OIL_CODES}`,
-    { headers, cf: { cacheTtl: 0 } });
-  if (!res.ok) throw new Error('Oil API ' + res.status);
-  const json = await res.json();
-  const b = pickQuote(json, BRENT_CODE);
-  const w = pickQuote(json, WTI_CODE);
-  const brent = Number(b && b.price) || 0, wti = Number(w && w.price) || 0;
-  if (!brent && !wti) throw new Error('OilPriceAPI 未解析出价');
-  return { brent, wti, provider: 'oilpriceapi',
-           stale: (b && b.stale === true) || json.stale === true,
-           asOf: (b && (b.as_of || b.as_of_at || b.created_at)) || '',
-           note: 'OilPriceAPI（兜底）' };
-}
-
-/* 主入口：按序尝试，拿到就停 */
-async function fetchOilMulti(apiKey) {
-  const srcs = [
-    ['biquote',   () => oilSrcBiquote()],
-    ['yahoo',     () => oilSrcYahoo('query1.finance.yahoo.com')],
-    ['yahoo2',    () => oilSrcYahoo('query2.finance.yahoo.com')],
-    ['stooq',     () => oilSrcStooq()],
-    ['oilpriceapi', () => oilSrcOilPriceApi(apiKey)],
-  ];
-  const tried = [];
-  for (const [id, fn] of srcs) {
-    try {
-      const r = await fn();
-      if (r && (r.brent || r.wti)) {
-        return { ...r, asOf: r.asOf || new Date().toISOString(), tried };
-      }
-      tried.push({ id, ok: false, error: '返回为空' });
-    } catch (e) {
-      tried.push({ id, ok: false, error: String(e && e.message || e) });
-    }
-  }
-  throw new Error('全部原油源均失败：' + JSON.stringify(tried));
-}
-
-
 // 两个品种的历史走势配置（共用 recordDailyHistory，只是 KV key 和标题不同）
 const HISTORY_SPECS = {
   brent: { kvKey: 'brent_history', label: '布伦特原油', code: BRENT_CODE },
@@ -1205,28 +1079,25 @@ async function fetchAndSave(env, isClosing = false, record = null) {
 
   const prev = await env.OIL_KV.get('oil_data', 'json').catch(() => null);
 
-  // ★ B11：改为与 2 号同源的多源链路（biquote → yahoo → yahoo2 → stooq → oilpriceapi）
-  const live = await fetchOilMulti(apiKey);
-  const brentPrice = Number(live.brent) || 0;
-  const wtiPrice   = Number(live.wti)   || 0;
+  // 一次请求拿布伦特 + WTI；拿不到批量就自动降级只请求布伦特（见 fetchOilJson）
+  const { json, mode } = await fetchOilJson(apiKey);
+  const p = pickQuote(json, BRENT_CODE) || ((json && json.data) || {});
 
-  const stale = live.stale === true;
-  const asOf = live.asOf || null;
+  const stale = p.stale === true || json.stale === true;
+  const asOf = p.as_of || p.as_of_at || p.created_at || p.timestamp || null;
 
   const result = {
-    price: brentPrice,
-    formatted: brentPrice ? '$' + brentPrice.toFixed(2) : null,
-    timestamp: new Date().toISOString(),    // 收集时间
-    asOf,                                   // 源观测时间
-    stale,                                  // true = 沿用值
+    price: p.price,
+    formatted: p.formatted,
+    timestamp: p.created_at || p.timestamp || null,   // 收集时间
+    asOf,                                             // 源观测时间
+    stale,                                            // true = 沿用值
     updatedLocal: beijingNow(),
-    isClosing: !!isClosing,
-    isSettlement: !!isClosing,
+    isClosing: !!isClosing,                 // true = 当日收盘价（休市后 1 小时抓取）
+    isSettlement: !!isClosing,              // 兼容旧字段，含义同上
     prevPrice: prev && prev.price != null ? prev.price : null,
-    changed: prev ? String(prev.price) !== String(brentPrice) : null,
-    sourceMode: live.provider || 'multi',   // 实际生效的源
-    provider: live.provider || null,
-    tried: live.tried || [],
+    changed: prev ? String(prev.price) !== String(p.price) : null,
+    sourceMode: mode,                       // 'batch' = 一次拿两个；'single' = 降级只拿布伦特
   };
 
   await env.OIL_KV.put('oil_data', JSON.stringify(result), { expirationTtl: 86400 * 2 });
@@ -1234,23 +1105,24 @@ async function fetchAndSave(env, isClosing = false, record = null) {
   // WTI：白捡的第二个品种，同一次请求里带回来的，不额外消耗配额。
   // 拿不到就跳过，绝不影响布伦特（主流程已存完）。
   let wti = null;
-  // ★ B11：WTI 直接取多源结果，不再依赖 OilPriceAPI 的批量模式
-  if (wtiPrice) {
+  // 只在批量模式里找 WTI：降级模式压根没请求 WTI，不该有数据。
+  // 双保险 —— 即使 pickQuote 兜底逻辑将来有变动，也不会把布伦特当 WTI 存进去。
+  const w = mode === 'batch' ? pickQuote(json, WTI_CODE) : null;
+  if (w && w.price != null) {
     const prevW = await env.OIL_KV.get('wti_data', 'json').catch(() => null);
     wti = {
       code: WTI_CODE,
       name: 'WTI 原油',
-      price: wtiPrice,
-      formatted: `$${wtiPrice.toFixed(2)}`,
-      timestamp: new Date().toISOString(),
-      asOf: asOf,
-      stale: stale,
+      price: w.price,
+      formatted: w.formatted || `$${w.price}`,
+      timestamp: w.created_at || w.timestamp || null,
+      asOf: w.as_of || w.as_of_at || w.created_at || w.timestamp || null,
+      stale: w.stale === true,
       updatedLocal: beijingNow(),
       isClosing: !!isClosing,
       prevPrice: prevW && prevW.price != null ? prevW.price : null,
-      changed: prevW ? String(prevW.price) !== String(wtiPrice) : null,
-      sourceMode: live.provider || 'multi',
-      provider: live.provider || null,
+      changed: prevW ? String(prevW.price) !== String(w.price) : null,
+      sourceMode: mode,
     };
     await env.OIL_KV.put('wti_data', JSON.stringify(wti), { expirationTtl: 86400 * 2 });
 
