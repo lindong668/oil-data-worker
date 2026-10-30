@@ -176,8 +176,14 @@ async function loadRows(env, kvKey, seed) {
   let hist = null;
   try { hist = await env.OIL_KV.get(kvKey, 'json'); } catch (_) {}
   const rows = (hist && hist.rows) ? hist.rows : [];
-  if (rows.length) return { rows: rows, fromSeed: false };
-  return { rows: seedToRows(seed), fromSeed: true };
+  const seedRows = seedToRows(seed);
+  /* ★ 取「条数多」的一方，而不是无脑 KV 优先。
+   *   3 号早期自建累积往 brent_history 写的是稀疏采样行（可能只有几十条），
+   *   无脑 KV 优先会让这几十条遮蔽内置的 455 条真实日线，
+   *   表现为：年份下拉只有最近一个月、曲线只能缩到一两月。
+   *   种子导入（/seed-history）之后 KV 条数 ≥ 种子，自然切回 KV。 */
+  if (rows.length >= seedRows.length) return { rows: rows, fromSeed: false };
+  return { rows: seedRows, fromSeed: true };
 }
 
 // ------------------------------------------------------------

@@ -1342,7 +1342,12 @@ async function fetchAndSave(env, isClosing = false, record = null) {
 
     // WTI 攒走势 —— 只在 WTI 自己的交易/收盘窗口内记（force=手动时不设限）。
     // 失败也不影响布伦特（各自独立 catch）。
-    if (recWti) {
+    /* ★ B16：WTI 历史行不再由自建累积写入。
+     *   理由：① 采样点稀疏，开/高/低只是采样极值而非真实 OHLC，与 Investing 口径有偏差；
+     *        ② 每小时 2 次 × 2 品种 = 96 次/天 KV 写入，是免费版 1,000 次配额的大头之一。
+     *   历史基准改由种子导入（/seed-history）+ 收盘后 Yahoo 官方日线定格（B12）负责。
+     *   抓取本身照旧，oil_data / wti_data 仍写，前端抓不到时仍可兜底。 */
+    if (false && recWti) {
       await recordDailyHistory(env, {
         price: wti.price,
         isClosing: !!isClosing && isWtiClosing(),
@@ -1353,8 +1358,8 @@ async function fetchAndSave(env, isClosing = false, record = null) {
     }
   }
 
-  // 顺手把本次价格记进历史走势（自建累积，零额外额度）
-  if (recBrent) {
+  /* ★ B16：同上，布伦特历史行也不再由自建累积写入。 */
+  if (false && recBrent) {
     await recordDailyHistory(env, {
       price: result.price,
       isClosing: !!isClosing && isBrentClosing(),
@@ -1991,9 +1996,19 @@ async function fetchGoldAndSave(env, { manual = false, bootstrap = false } = {})
   /* KV 写入单独兜一层：万一撞上免费版 1,000 次/天的写入配额，
    * 不能让"写不进去"变成"这次抓取整个失败"——
    * 价已经拿到了，照样返回，只是标注 persisted=false 便于排查。 */
+  /* ★ B16：写入降频 —— 价格没变就不写。
+   *   黄金每 3 分钟抓一次，若每次都写 = 480 次/天，几乎吃掉免费版 1,000 次配额的一半。
+   *   价格未变时写进去和原来一字不差，纯属浪费；休市时段尤其明显。
+   *   但 gold_data 的 TTL 只有 2 天，长期不写会过期消失，
+   *   所以超过 1 小时强制补写一次「保活写」。 */
+  const lastWriteMs = (cached && cached.fetchedAtMs) ? cached.fetchedAtMs : 0;
+  const needKeepAlive = Date.now() - lastWriteMs > 3600 * 1000;
+  const needWrite = gold.changed !== false || needKeepAlive;
   let persisted = true;
   try {
-    await env.OIL_KV.put('gold_data', JSON.stringify(gold), { expirationTtl: 86400 * 2 });
+    if (needWrite) {
+      await env.OIL_KV.put('gold_data', JSON.stringify(gold), { expirationTtl: 86400 * 2 });
+    }
   } catch (e) {
     persisted = false;
     console.log(`[gold] KV 写入失败（可能已超每日配额）: ${e.message}`);
