@@ -1,6 +1,6 @@
 import { SEED_BRENT, SEED_WTI } from './seed.js';
 import { fetchTick, renderOilReportPage } from './oilReport.js';   /* ★ B13 原油秒级专页 */
-import { recordSample, sessionSnapshot, aggregateFromMinutes, pruneMinutes } from './session.js'; /* ★ B18 自建开收盘判定 */
+import { recordSample, sessionSnapshot, aggregateFromMinutes, pruneMinutes, runRetention, dbStats, KEEP_TICK_DAYS } from './session.js'; /* ★ B18 自建开收盘判定 */
 
 /**
  * oil-data-worker  v8
@@ -1006,6 +1006,20 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
       }, null, 2), { headers: JSON_HEADERS });
     }
 
+    // ---------------- /db-stats D1 容量体检（B18）----------------
+    if (url.pathname === '/db-stats') {
+      if (!ok) {
+        return new Response(JSON.stringify({ error: 'forbidden' }), {
+          status: 403, headers: JSON_HEADERS,
+        });
+      }
+      const s = await dbStats(env);
+      return new Response(JSON.stringify(
+        s ? Object.assign({ ok: true }, s) : { ok: false, note: 'D1 未绑定，采样未启用' },
+        null, 2,
+      ), { headers: JSON_HEADERS });
+    }
+
     // ---------------- /prune-minutes 手动清理旧采样（B18）----------------
     if (url.pathname === '/prune-minutes') {
       if (!ok) {
@@ -1805,6 +1819,15 @@ async function runDailySettle(env, now = new Date()) {
       continue;
     }
     out[code] = await applyDailyBar(env, code, bar);
+  }
+
+  /* ★ B18：每天自动清一次旧采样。
+     D1 满了不会自动删旧数据，写不进去就是硬失败，所以必须自己兜着跑。
+     这里挂在收盘定格那条 cron 上（不新增 cron —— 免费版每个 Worker 最多 3 条），
+     用 UTC 23 点做门控，一天只真跑一次；没匹配到行时 rows written = 0，不花额度。 */
+  if (now.getUTCHours() === 23) {
+    const r = await runRetention(env);
+    if (r) out._retention = r;
   }
   return out;
 }

@@ -68,9 +68,19 @@ const SCHEMA = [
      high REAL, low REAL,
      src TEXT
    );`,
-  `CREATE INDEX IF NOT EXISTS idx_tick_min_code_ts ON tick_min(code, ts);`,
   `CREATE INDEX IF NOT EXISTS idx_session_log_code_day ON session_log(code, day);`,
+  // ★ tick_min 是 WITHOUT ROWID 且主键就是 (code, ts)，再建一个 (code,ts) 索引
+  //   纯属重复 —— 白占一倍存储、每次写入还要多维护一份。这里主动删掉
+  //   （老库已建过的会被 DROP，新库 IF NOT EXISTS 直接跳过）。
+  `DROP INDEX IF EXISTS idx_tick_min_code_ts;`,
 ];
+
+// ---- 保留策略（天）----
+// 分钟采样只用于「判定开收盘 + 当日兜底 OHLC」，用完就该扔。
+// 留 7 天足够覆盖一个完整交易周 + 周末，再多就是纯占空间。
+export const KEEP_TICK_DAYS = 7;
+// 会话日志一行一天，极小（2 品种 × 365 ≈ 730 行/年），留 2 年做历史核对。
+export const KEEP_LOG_DAYS = 730;
 
 let schemaReady = false;
 
@@ -254,10 +264,13 @@ export async function aggregateFromMinutes(env, code, day) {
         close: row.close_price, samples: 0, src: 'self',
       };
     }
-    // log 还没有 → 退回按当天分钟数据现算
+    // log 还没有 → 退回按「当天」的分钟数据现算。
+    // ★ 不能 SELECT 全部 ts：保留 7 天的话 open 会变成 7 天前那一笔。
+    //   按 day 换算一个 ±14h 的 UTC 窗口，覆盖伦敦/芝加哥的时区偏移即可。
+    const w = dayWindow(day);
     const rows = await env.DB.prepare(
-      'SELECT price FROM tick_min WHERE code = ? ORDER BY ts'
-    ).bind(code).all();
+      'SELECT price FROM tick_min WHERE code = ? AND ts >= ? AND ts < ? ORDER BY ts'
+    ).bind(code, w.from, w.to).all();
     const all = (rows && rows.results) || [];
     if (!all.length) return null;
     let o = all[0].price, h = all[0].price, l = all[0].price, c = all[all.length - 1].price;
@@ -270,11 +283,20 @@ export async function aggregateFromMinutes(env, code, day) {
   } catch (e) { return null; }
 }
 
+/** 'YYYY-MM-DD' → 覆盖该市场本地日的 UTC 秒窗口（前开后闭，多留 14h 余量） */
+export function dayWindow(day) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(day || ''));
+  const base = m
+    ? Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])) / 1000
+    : Math.floor(Date.now() / 1000);
+  return { from: base - 14 * 3600, to: base + 38 * 3600 };
+}
+
 /**
  * 清掉某品种超过保留天数的分钟数据（防止无限膨胀）。
  * DELETE 也算 rows written，所以别天天跑 —— 建议每周一次。
  */
-export async function pruneMinutes(env, code, keepDays = 7) {
+export async function pruneMinutes(env, code, keepDays = KEEP_TICK_DAYS) {
   if (!(await ensureSchema(env))) return 0;
   try {
     const cut = Math.floor(Date.now() / 1000) - keepDays * 86400;
@@ -283,6 +305,36 @@ export async function pruneMinutes(env, code, keepDays = 7) {
     ).bind(code, cut).run();
     return (r && r.meta && r.meta.changes) || 0;
   } catch (e) { return 0; }
+}
+
+/** 清掉超过保留天数的会话日志（一行一天，量极小，主要防多年累积） */
+export async function pruneLogs(env, keepDays = KEEP_LOG_DAYS) {
+  if (!(await ensureSchema(env))) return 0;
+  try {
+    const cut = new Date(Date.now() - keepDays * 86400000)
+      .toISOString().slice(0, 10);
+    const r = await env.DB.prepare(
+      'DELETE FROM session_log WHERE day < ?'
+    ).bind(cut).run();
+    return (r && r.meta && r.meta.changes) || 0;
+  } catch (e) { return 0; }
+}
+
+/**
+ * ★ 自动保留：由收盘定格那条 cron 每天带一次，不用你手动点。
+ *   D1 满了不会自动清，写不进去就是硬失败，所以必须自己兜。
+ *   DELETE 没匹配到行时 rows written = 0，天天跑也不花额度。
+ */
+export async function runRetention(env) {
+  if (!(await ensureSchema(env))) return null;
+  const out = {};
+  for (const c of ['brent', 'wti']) {
+    out[c] = {
+      ticks: await pruneMinutes(env, c, KEEP_TICK_DAYS),
+    };
+  }
+  out.logs = await pruneLogs(env, KEEP_LOG_DAYS);
+  return out;
 }
 
 /** 给前端/调试看：当前判定 + 最近会话 */
@@ -313,6 +365,34 @@ export async function sessionSnapshot(env, code, now = new Date()) {
       openTs: l.open_ts, closeTs: l.close_ts,
       open: l.open_price, close: l.close_price, high: l.high, low: l.low,
     })),
+  };
+}
+
+/**
+ * 库容量体检：给 /db-stats 用。
+ * 返回各表行数 + 粗估体积，让你一眼看到离 5 GB 上限还有多远。
+ */
+export async function dbStats(env) {
+  if (!(await ensureSchema(env))) return null;
+  const q = async (sql) => {
+    try {
+      const r = await env.DB.prepare(sql).first();
+      return r ? Number(r.n || 0) : 0;
+    } catch (e) { return -1; }
+  };
+  const ticks = await q('SELECT COUNT(*) AS n FROM tick_min');
+  const logs = await q('SELECT COUNT(*) AS n FROM session_log');
+  const states = await q('SELECT COUNT(*) AS n FROM session_state');
+  // 粗估：WITHOUT ROWID 行约 40 字节 + 页开销，按 64 字节/行保守计
+  const bytes = Math.max(0, ticks) * 64 + Math.max(0, logs) * 96 + Math.max(0, states) * 160;
+  return {
+    rows: { tick_min: ticks, session_log: logs, session_state: states },
+    estBytes: bytes,
+    estMB: Math.round((bytes / 1048576) * 100) / 100,
+    limitGB: 5,
+    usedPct: Math.round((bytes / (5 * 1073741824)) * 10000) / 10000,
+    keepTickDays: KEEP_TICK_DAYS,
+    note: 'tick_min 每天自动清到保留窗口；触及 5GB 后写入会直接失败（D1 不会自动删）',
   };
 }
 
