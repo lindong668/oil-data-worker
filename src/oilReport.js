@@ -417,6 +417,8 @@ export async function renderOilReportPage(env, code, keyQS) {
   h.push('td:first-child{text-align:left;color:#94a3b8}');
   h.push('tbody tr:hover{background:#0f172a}');
   h.push('.up{color:' + UP + '}.down{color:' + DOWN + '}');
+  h.push('.tblbox{max-height:340px;overflow:auto;-webkit-overflow-scrolling:touch;border:1px solid #1e293b;border-radius:10px}');
+  h.push('.tblbox thead th{position:sticky;top:0;background:#111c31;z-index:2}');
   h.push('.filters{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}');
   h.push('.filters select{background:#0f172a;border:1px solid #1e293b;color:#e2e8f0;border-radius:8px;padding:5px 8px;font-size:12px;font-family:inherit}');
   h.push('.filters .cnt{font-size:11px;color:#64748b;margin-left:auto}');
@@ -464,7 +466,7 @@ export async function renderOilReportPage(env, code, keyQS) {
   h.push('<div class="filters">'
     + '<select id="fy"></select><select id="fm"></select>'
     + '<span class="cnt" id="tcount"></span></div>');
-  h.push('<div style="overflow-x:auto"><table id="tbl"><thead><tr>'
+  h.push('<div class="tblbox" id="tblbox"><table id="tbl"><thead><tr>'
     + '<th>Date</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Change</th>'
     + '</tr></thead><tbody></tbody></table></div>');
   h.push('<button class="more" id="more">Show all ▼</button>');
@@ -654,9 +656,15 @@ function inlineScript() {
     /* ---- 表格 ---- */
     'function filteredIdx(){',
     '  var all=DATA[CODE]||[],out=[],i,d;',
+    '  var effY=SEL_Y;',
+    '  if(SEL_Y==="all"&&SEL_M!="all"){',
+    '    for(i=all.length-1;i>=0;i--){',
+    '      if(all[i][0].slice(5,7)===SEL_M){effY=all[i][0].slice(0,4);break}',
+    '    }',
+    '  }',
     '  for(i=all.length-1;i>=0;i--){',
     '    d=all[i][0];',
-    '    if(SEL_Y!=="all"&&d.slice(0,4)!==SEL_Y)continue;',
+    '    if(effY!=="all"&&d.slice(0,4)!==effY)continue;',
     '    if(SEL_M!="all"&&d.slice(5,7)!==SEL_M)continue;',
     '    out.push(i);',
     '  }',
