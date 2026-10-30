@@ -4,8 +4,8 @@
  * v2 改动（针对「手动刷新拉不到新数据」问题）：
  *  1. 原油：抓取时一并记录 stale（沿用值标记）与 as_of（源观测时间），
  *     并在 /update、/data、首页展示，能区分「没抓到」与「抓到了但源未刷新」。
- *  2. 黄金：★ B8 三源 xaus(主)→biquote(备)→gold-api(兜底)，循环 2 轮，每 3 分钟抓取
- *     （专用 cron，每 3 分钟；受 KV 免费版 1,000 次/天写入配额限制，不能每分钟）；
+ *  2. 黄金：★ B8 三源 xaus(主)→biquote(备)→gold-api(兜底)，循环 2 轮，每 6 分钟抓取
+ *     （专用 cron，每 6 分钟；受 KV 免费版 1,000 次/天写入配额限制，不能每分钟）；
  *     三源均无 key、无限流，因此不再需要"每天只抓一次"的配额保护。
  *  3. 所有响应加 Cache-Control: no-store，避免中间缓存导致「点了没真发出去」。
  *
@@ -123,6 +123,132 @@ const OIL_CODES = 'BRENT_CRUDE_USD,WTI_USD';
 const BRENT_CODE = 'BRENT_CRUDE_USD';
 const WTI_CODE = 'WTI_USD';
 const OIL_LATEST_BASE = 'https://api.oilpriceapi.com/v1/prices/latest';
+
+/* ============================================================
+ * ★ B11：原油抓取改为【与 2 号同源的多源链路】
+ * ------------------------------------------------------------
+ * 背景：原用 OilPriceAPI（需 Token、有配额），实测出现过
+ *   101.53（那其实是 WTI 的价）与 114.19（高出市场约 3%）这类偏离值，
+ *   导致 3 号的收盘定格与 2 号实时链路对不上（110.70 vs 114.19）。
+ * 现在改成与 2 号完全同源：biquote → yahoo → yahoo2 → stooq，
+ *   OilPriceAPI 降级为最后兜底（仍可用，但不作为主源）。
+ * 好处：2 号与 3 号取同一个市场价 → 定格值、报表天然一致。
+ * ============================================================ */
+
+const OIL_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
+
+async function oilGetJson(u, ms = 3500, headers = {}) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), ms);
+  try {
+    const r = await fetch(u, {
+      signal: ac.signal,
+      cache: 'no-store',
+      headers: { Accept: 'application/json', 'User-Agent': OIL_UA, ...headers },
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
+/* 源 1：biquote —— 券商 MT5 链路（2 号黄金在用，实测偏差 < 0.04%） */
+async function oilSrcBiquote() {
+  const [w, b] = await Promise.all([
+    oilGetJson('https://biquote.io/api/XTIUSD'),
+    oilGetJson('https://biquote.io/api/XBRUSD'),
+  ]);
+  const mid = (j) => {
+    const bid = Number(j && j.bid), ask = Number(j && j.ask);
+    if (bid && ask) return (bid + ask) / 2;
+    return Number(j && j.mid) || 0;
+  };
+  const wti = mid(w), brent = mid(b);
+  if (!wti && !brent) throw new Error('biquote 两个符号都没返回价');
+  return { brent, wti, provider: 'biquote', note: '券商 MT5 链路' };
+}
+
+/* 源 2：Yahoo Finance（2 号实测布伦特 111.91，与市场一致） */
+async function oilSrcYahoo(host) {
+  const one = async (sym) => {
+    const j = await oilGetJson(
+      `https://${host}/v8/finance/chart/${sym}?interval=1m&range=1d`, 3500);
+    const res = j && j.chart && j.chart.result && j.chart.result[0];
+    const meta = res && res.meta;
+    const p = Number(meta && (meta.regularMarketPrice || meta.previousClose));
+    if (!p) throw new Error('Yahoo ' + sym + ' 无价');
+    return p;
+  };
+  const [b, w] = await Promise.all([one('BZ=F'), one('CL=F')]);
+  return { brent: b, wti: w, provider: host === 'query1.finance.yahoo.com' ? 'yahoo' : 'yahoo2',
+           note: 'Yahoo Finance 期货' };
+}
+
+/* 源 4：Stooq 免费 CSV（无需 key） */
+async function oilSrcStooq() {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 3500);
+  try {
+    const r = await fetch('https://stooq.com/q/l/?s=cb.f+cl.f&f=sd2t2ohlcv&h&e=csv',
+      { signal: ac.signal, cache: 'no-store', headers: { 'User-Agent': OIL_UA } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const txt = await r.text();
+    const rows = txt.trim().split('\n').slice(1);
+    let brent = 0, wti = 0;
+    for (const line of rows) {
+      const c = line.split(',');
+      const sym = (c[0] || '').toUpperCase();
+      const close = Number(c[6]);
+      if (!close) continue;
+      if (sym.includes('CB.F')) brent = close;
+      if (sym.includes('CL.F')) wti = close;
+    }
+    if (!brent && !wti) throw new Error('Stooq 未解析出价');
+    return { brent, wti, provider: 'stooq', note: 'Stooq 免费 CSV' };
+  } finally { clearTimeout(t); }
+}
+
+/* 兜底：OilPriceAPI（保留原逻辑，仅在主源全挂时使用） */
+async function oilSrcOilPriceApi(apiKey) {
+  if (!apiKey) throw new Error('Missing OILPRICEAPI_KEY');
+  const headers = { 'Authorization': `Token ${apiKey}` };
+  const res = await fetch(`${OIL_LATEST_BASE}?by_code=${OIL_CODES}`,
+    { headers, cf: { cacheTtl: 0 } });
+  if (!res.ok) throw new Error('Oil API ' + res.status);
+  const json = await res.json();
+  const b = pickQuote(json, BRENT_CODE);
+  const w = pickQuote(json, WTI_CODE);
+  const brent = Number(b && b.price) || 0, wti = Number(w && w.price) || 0;
+  if (!brent && !wti) throw new Error('OilPriceAPI 未解析出价');
+  return { brent, wti, provider: 'oilpriceapi',
+           stale: (b && b.stale === true) || json.stale === true,
+           asOf: (b && (b.as_of || b.as_of_at || b.created_at)) || '',
+           note: 'OilPriceAPI（兜底）' };
+}
+
+/* 主入口：按序尝试，拿到就停 */
+async function fetchOilMulti(apiKey) {
+  const srcs = [
+    ['biquote',   () => oilSrcBiquote()],
+    ['yahoo',     () => oilSrcYahoo('query1.finance.yahoo.com')],
+    ['yahoo2',    () => oilSrcYahoo('query2.finance.yahoo.com')],
+    ['stooq',     () => oilSrcStooq()],
+    ['oilpriceapi', () => oilSrcOilPriceApi(apiKey)],
+  ];
+  const tried = [];
+  for (const [id, fn] of srcs) {
+    try {
+      const r = await fn();
+      if (r && (r.brent || r.wti)) {
+        return { ...r, asOf: r.asOf || new Date().toISOString(), tried };
+      }
+      tried.push({ id, ok: false, error: '返回为空' });
+    } catch (e) {
+      tried.push({ id, ok: false, error: String(e && e.message || e) });
+    }
+  }
+  throw new Error('全部原油源均失败：' + JSON.stringify(tried));
+}
+
 
 // 两个品种的历史走势配置（共用 recordDailyHistory，只是 KV key 和标题不同）
 const HISTORY_SPECS = {
@@ -663,7 +789,7 @@ ${wtiCached && wtiCached.price != null ? `
 
 ${g ? `
 <h2 style="margin-top:32px">🪙 国际黄金（XAU/USD）</h2>
-<p><strong>⚡ 现货参考价（每 3 分钟采集，三源互为备用）</strong></p>
+<p><strong>⚡ 现货参考价（每 6 分钟采集，三源互为备用）</strong></p>
 <table style="width:100%;border-collapse:collapse;margin:20px 0">
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">每盎司价格</td><td style="padding:8px 0">$${g.priceUsdPerOz} USD/盎司</td></tr>
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">每克价格</td><td style="padding:8px 0">≈ ¥${g.priceCnyPerGram} / 克</td></tr>
@@ -673,7 +799,7 @@ ${g ? `
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">本次采集时刻</td><td style="padding:8px 0">${g.fetchedLocal || '—'} <span style="font-size:12px;color:#999">(北京时间)</span></td></tr>
 <tr style="border-bottom:1px solid #eee"><td style="padding:8px 0;color:#666">上次价格 / 是否变化</td><td style="padding:8px 0">${g.prevPriceUsdPerOz ?? '—'} / ${g.changed === null ? '—' : (g.changed ? '有变化' : '无变化')}</td></tr>
 </table>
-<p style="font-size:12px;color:#999">ℹ️ 黄金每 3 分钟自动抓取一次（专用 cron "*/3"，与原油的 "5,20" 分开）；三源均无 key、无限流，按序 xaus → biquote → gold-api，失败后循环重试 2 轮。实时跳动由 2 号前端在浏览器直连 biquote 完成，本层为兜底与首屏。</p>` : ''}
+<p style="font-size:12px;color:#999">ℹ️ 黄金每 6 分钟自动抓取一次（专用 cron "*/6"，与原油的 "5,20" 分开）；三源均无 key、无限流，按序 xaus → biquote → gold-api，失败后循环重试 2 轮。实时跳动由 2 号前端在浏览器直连 biquote 完成，本层为兜底与首屏。</p>` : ''}
 
 ${cn && cn.list && cn.list.length ? `
 <h2 style="margin-top:32px">🇨🇳 国内成品油指导价</h2>
@@ -692,7 +818,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
 </table>` : ''}
 
 <p style="font-size:14px;color:#666">🕐 你的本地时间：<span id="localTime"></span> <span style="font-size:12px;color:#999" id="tz"></span></p>
-<p style="font-size:12px;color:#aaa">以上为国际原料与成品油参考价，非零售汽油价 / 首饰金价。黄金为现货参考价，每 3 分钟采集一次，不代表柜台成交价。</p>
+<p style="font-size:12px;color:#aaa">以上为国际原料与成品油参考价，非零售汽油价 / 首饰金价。黄金为现货参考价，每 6 分钟采集一次，不代表柜台成交价。</p>
 <p style="font-size:12px;color:#aaa"><a href="https://xaus.com" target="_blank" rel="noopener">Gold data: XAUS</a> · <a href="/update${keyQS}">手动刷新</a> · <a href="/history${keyQS}">📈 布伦特走势</a> · <a href="/history?code=wti${keyQS.replace('?', '&')}">📈 WTI走势</a> · <a href="/data${keyQS}">原始JSON</a></p>
 
 <script>
@@ -802,7 +928,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
           from: gold.fetchedFrom,
           stale: gold.stale,
           fetchedLocal: gold.fetchedLocal,
-          note: 'B8 起黄金每 3 分钟抓取（专用 cron "*/3"，与原油 "5,20" 分开），三源 xaus→biquote→gold-api 循环 2 轮',
+          note: 'B8 起黄金每 6 分钟抓取（专用 cron "*/6"，与原油 "5,20" 分开），三源 xaus→biquote→gold-api 循环 2 轮',
         } : null,
         cnOilFetchMarker: cnMarker || null,
         // 布伦特历史走势（自建累积：cron 抓取时顺便记录，零额外额度）
@@ -828,7 +954,7 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
           rows: goldHist.rows?.length ?? 0,
           latest: goldHist.rows?.[goldHist.rows.length - 1] ?? null,
           data: goldHist.rows ?? [],
-          note: '数据来自本站自身每 3 分钟一次的实时抓取，收盘价取自结算前最后一次真实成交',
+          note: '数据来自本站自身每 6 分钟一次的实时抓取，收盘价取自结算前最后一次真实成交',
         } : null,
       }, null, 2), { headers: JSON_HEADERS });
     }
@@ -995,13 +1121,13 @@ ${histDetail}
     const h = beijingHour(now);   // 北京时间小时（cron 整点触发，必为整数）
     const jobs = [];
 
-    /* ★ B8：黄金由专用 cron（每 3 分钟一次）唤醒，与原油的 "5,20" 分开。
+    /* ★ B8：黄金由专用 cron（每 6 分钟一次）唤醒，与原油的 "5,20" 分开。
      *
      * 为什么不是每分钟 —— 受 KV 写入配额限制，不是源的限制：
      *   Workers KV 免费版每天只允许 1,000 次写入。
      *   黄金每抓成功一次就写一次 gold_data，每分钟 = 1,440 次/天，
      *   会在当天下午把配额耗光，之后写入报错、首屏数字静默冻住。
-     *   每 3 分钟 = 480 次/天，配合原油约 25 次，留有一倍余量。
+     *   每 6 分钟 = 480 次/天，配合原油约 25 次，留有一倍余量。
      *
      * 3 号这一层是兜底 + 首屏，真正的实时跳动由 2 号前端在浏览器里
      * 直连 biquote 完成，兜底旧 3 分钟没有可感知差别。
@@ -1012,7 +1138,7 @@ ${histDetail}
 
     /* ★★ B9 关键修复：先分清【是哪条 cron 唤醒的】，再决定跑什么。
      *
-     * B8 加了第二条 cron（每 3 分钟那条，专跑黄金），但两条共用同一个 scheduled()，
+     * B8 加了第二条 cron（每 6 分钟那条，专跑黄金），但两条共用同一个 scheduled()，
      * 而函数里没有任何分流 —— 于是该 cron 每次唤醒也把原油整套逻辑跑了一遍：
      *   ① 原油被多抓（本该只在 :05 / :20），配额白白消耗；
      *   ② 更糟的是 cronPhase() = getUTCMinutes() < 10 ? 'open' : 'close'，
@@ -1022,18 +1148,22 @@ ${histDetail}
      *
      * 分流依据：
      *   首选 controller.cron（Cloudflare 回传本次触发的表达式）。
-     *   兜底用分钟数 —— "5,20" 的两个值都不是 3 的倍数，
-     *   该 cron 的触发分钟全部是 3 的倍数，两个集合完全不重叠，
-     *   故 min % 3 能 100% 分开，不会误判。
+     *   兜底用分钟数 —— "5,20" 的两个值都不是 6 的倍数，
+     *   黄金那条 cron 的触发分钟全部是 6 的倍数，两个集合完全不重叠，
+     *   故 min % 6 能 100% 分开，不会误判（6 与 {5,20} 不重叠）。
      */
     const cronSpec = (controller && controller.cron) ? String(controller.cron) : '';
     const isGoldTick = cronSpec
-      ? cronSpec.indexOf('*/3') !== -1          // 明确来自黄金那条
-      : (min % 3 === 0);                        // 兜底：按分钟分流
+      ? cronSpec.indexOf('*/6') !== -1          // 明确来自黄金那条
+      : (min % 6 === 0);                        // 兜底：按分钟分流
+    /* ★ 为什么是 6 而不是 5：原油那条 cron 在 :05 与 :20 触发，
+     *   5 和 20 都是 5 的倍数 —— 若黄金用 */5，两条 cron 会撞车，
+     *   兜底分流会失效，原油被多跑、配额白白消耗。
+     *   6 的倍数（0,6,…,54）与 {5,20} 完全不重叠，故安全。 */
 
     if (isGoldTick) {
       jobs.push(fetchGoldAndSave(env, { manual: false }));
-      console.log(`[cron] 黄金抓取 — 北京 ${h}:${String(min).padStart(2, '0')}，每 3 分钟一次`);
+      console.log(`[cron] 黄金抓取 — 北京 ${h}:${String(min).padStart(2, '0')}，每 6 分钟一次`);
       if (!jobs.length) return;
       await Promise.allSettled(jobs);
       return;                                    // ★ 只跑黄金，绝不碰原油
@@ -1079,25 +1209,28 @@ async function fetchAndSave(env, isClosing = false, record = null) {
 
   const prev = await env.OIL_KV.get('oil_data', 'json').catch(() => null);
 
-  // 一次请求拿布伦特 + WTI；拿不到批量就自动降级只请求布伦特（见 fetchOilJson）
-  const { json, mode } = await fetchOilJson(apiKey);
-  const p = pickQuote(json, BRENT_CODE) || ((json && json.data) || {});
+  // ★ B11：改为与 2 号同源的多源链路（biquote → yahoo → yahoo2 → stooq → oilpriceapi）
+  const live = await fetchOilMulti(apiKey);
+  const brentPrice = Number(live.brent) || 0;
+  const wtiPrice   = Number(live.wti)   || 0;
 
-  const stale = p.stale === true || json.stale === true;
-  const asOf = p.as_of || p.as_of_at || p.created_at || p.timestamp || null;
+  const stale = live.stale === true;
+  const asOf = live.asOf || null;
 
   const result = {
-    price: p.price,
-    formatted: p.formatted,
-    timestamp: p.created_at || p.timestamp || null,   // 收集时间
-    asOf,                                             // 源观测时间
-    stale,                                            // true = 沿用值
+    price: brentPrice,
+    formatted: brentPrice ? '$' + brentPrice.toFixed(2) : null,
+    timestamp: new Date().toISOString(),    // 收集时间
+    asOf,                                   // 源观测时间
+    stale,                                  // true = 沿用值
     updatedLocal: beijingNow(),
-    isClosing: !!isClosing,                 // true = 当日收盘价（休市后 1 小时抓取）
-    isSettlement: !!isClosing,              // 兼容旧字段，含义同上
+    isClosing: !!isClosing,
+    isSettlement: !!isClosing,
     prevPrice: prev && prev.price != null ? prev.price : null,
-    changed: prev ? String(prev.price) !== String(p.price) : null,
-    sourceMode: mode,                       // 'batch' = 一次拿两个；'single' = 降级只拿布伦特
+    changed: prev ? String(prev.price) !== String(brentPrice) : null,
+    sourceMode: live.provider || 'multi',   // 实际生效的源
+    provider: live.provider || null,
+    tried: live.tried || [],
   };
 
   await env.OIL_KV.put('oil_data', JSON.stringify(result), { expirationTtl: 86400 * 2 });
@@ -1105,24 +1238,23 @@ async function fetchAndSave(env, isClosing = false, record = null) {
   // WTI：白捡的第二个品种，同一次请求里带回来的，不额外消耗配额。
   // 拿不到就跳过，绝不影响布伦特（主流程已存完）。
   let wti = null;
-  // 只在批量模式里找 WTI：降级模式压根没请求 WTI，不该有数据。
-  // 双保险 —— 即使 pickQuote 兜底逻辑将来有变动，也不会把布伦特当 WTI 存进去。
-  const w = mode === 'batch' ? pickQuote(json, WTI_CODE) : null;
-  if (w && w.price != null) {
+  // ★ B11：WTI 直接取多源结果，不再依赖 OilPriceAPI 的批量模式
+  if (wtiPrice) {
     const prevW = await env.OIL_KV.get('wti_data', 'json').catch(() => null);
     wti = {
       code: WTI_CODE,
       name: 'WTI 原油',
-      price: w.price,
-      formatted: w.formatted || `$${w.price}`,
-      timestamp: w.created_at || w.timestamp || null,
-      asOf: w.as_of || w.as_of_at || w.created_at || w.timestamp || null,
-      stale: w.stale === true,
+      price: wtiPrice,
+      formatted: `$${wtiPrice.toFixed(2)}`,
+      timestamp: new Date().toISOString(),
+      asOf: asOf,
+      stale: stale,
       updatedLocal: beijingNow(),
       isClosing: !!isClosing,
       prevPrice: prevW && prevW.price != null ? prevW.price : null,
-      changed: prevW ? String(prevW.price) !== String(w.price) : null,
-      sourceMode: mode,
+      changed: prevW ? String(prevW.price) !== String(wtiPrice) : null,
+      sourceMode: live.provider || 'multi',
+      provider: live.provider || null,
     };
     await env.OIL_KV.put('wti_data', JSON.stringify(wti), { expirationTtl: 86400 * 2 });
 
@@ -1334,17 +1466,22 @@ async function recordDailyHistory(env, { price, isClosing, kvKey = 'brent_histor
 //   两个新源均【无 key、无注册、无强制限流】，因此每日闸门可以拆掉，
 //   黄金改为跟原油一样每小时刷新。
 // ★ B8：再加 biquote.io 作第二源（券商 MT5，与另两源不同链路），
-//   并把频率提到每 3 分钟（专用 cron "*/3"）。
+//   并把频率提到每 6 分钟（专用 cron "*/6"）。
 // ------------------------------------------------------------
 const XAUS_URL = 'https://xaus.com/api/v1/spot';
 const GOLDAPI_URL = 'https://api.gold-api.com/price/XAU';
 const BIQUOTE_URL = 'https://biquote.io/api/XAUUSD';
 const TROY_OZ_TO_GRAM = 31.1034768;
+/* ★ 黄金采集间隔（分钟）—— 必须与 wrangler.toml 里黄金那条 cron 保持一致。
+ *  改动时两处一起改，否则「下一次采集时刻」判断会错位。 */
+const GOLD_TICK_MIN = 6;
+/* ★ 价格没变时最多攒多久必须强制写一次（分钟）—— 防止 key 过期 */
+const GOLD_FORCE_WRITE_MIN = 60;
 
 // ============================================================
 // 黄金自建日线（开/高/低/收）—— 与原油同一套思路
 // ------------------------------------------------------------
-// 一份数据两用：3 号每 3 分钟抓一次黄金，抓的同时顺手累积当日 OHLC，
+// 一份数据两用：3 号每 6 分钟抓一次黄金，抓的同时顺手累积当日 OHLC，
 // 不额外消耗任何抓取额度。
 //
 //   · 当日第一次抓取   → open
@@ -1413,7 +1550,9 @@ async function recordGoldOhlc(env, gold, now = new Date()) {
   }
 
   // ★ 收盘定格：下一次采集已不在交易时段 → 本轮即当日最后一笔真实成交
-  const nextState = goldMarketState(new Date(now.getTime() + 3 * 60 * 1000));
+  /* ★ 间隔必须与实际 cron 一致（现为 6 分钟），否则收盘定格时刻会判错，
+   *   把盘中价当成收盘价记进历史，污染走势曲线。 */
+  const nextState = goldMarketState(new Date(now.getTime() + GOLD_TICK_MIN * 60 * 1000));
   if (!t.settled && nextState !== 'open') {
     t.settled = true;
     t.close = price;
@@ -1591,11 +1730,26 @@ async function fetchGoldAndSave(env, { manual = false, bootstrap = false } = {})
    * 不能让"写不进去"变成"这次抓取整个失败"——
    * 价已经拿到了，照样返回，只是标注 persisted=false 便于排查。 */
   let persisted = true;
-  try {
-    await env.OIL_KV.put('gold_data', JSON.stringify(gold), { expirationTtl: 86400 * 2 });
-  } catch (e) {
-    persisted = false;
-    console.log(`[gold] KV 写入失败（可能已超每日配额）: ${e.message}`);
+  /* ★ 省配额：价格与上次完全一致时【不写】。
+   *   黄金每 6 分钟抓一次，但周末全天、每日结算时段价格根本不动，
+   *   这些写入纯属浪费（原本 480 次/天里有一大批是白写的）。
+   *
+   *   保底：距上次写入超过 GOLD_FORCE_WRITE_MIN 分钟强制写一次。
+   *   为什么必须保底 —— gold_data 的 expirationTtl 是 2 天，
+   *   若周末连续两天一次都不写，key 会过期，周一开盘前读到空值。 */
+  const lastWriteMs = (cached && cached.fetchedAtMs) ? cached.fetchedAtMs : 0;
+  const tooOld = !lastWriteMs || (Date.now() - lastWriteMs > GOLD_FORCE_WRITE_MIN * 60 * 1000);
+  const unchanged = (gold.changed === false);
+  if (unchanged && !tooOld) {
+    gold.persisted = true;          /* KV 里那份仍然有效，只是这次没重写 */
+    gold.writeSkipped = true;       /* 便于排查：本次因价格未变而跳过 */
+  } else {
+    try {
+      await env.OIL_KV.put('gold_data', JSON.stringify(gold), { expirationTtl: 86400 * 2 });
+    } catch (e) {
+      persisted = false;
+      console.log(`[gold] KV 写入失败（可能已超每日配额）: ${e.message}`);
+    }
   }
   gold.persisted = persisted;
   return { data: gold, prev: cached, skipped: false };
