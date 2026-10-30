@@ -409,7 +409,7 @@ export async function renderOilReportPage(env, code, keyQS) {
   h.push('.legend b{color:#e2e8f0;font-weight:600;font-variant-numeric:tabular-nums}');
   h.push('.legend .lg-name{color:#e2e8f0;font-weight:600}');
   h.push('.legend .lg-date{color:#64748b;font-variant-numeric:tabular-nums}');
-  h.push('#chart{width:100%;height:' + CHART_H + 'px;display:block;touch-action:none;cursor:crosshair;user-select:none}');
+  h.push('#chart{width:100%;height:' + CHART_H + 'px;display:block;touch-action:pan-y;cursor:crosshair;user-select:none}');
   h.push('table{width:100%;border-collapse:collapse;font-size:13px}');
   h.push('th{text-align:right;padding:8px 6px;color:#64748b;font-weight:500;border-bottom:1px solid #1e293b;font-size:12px}');
   h.push('th:first-child{text-align:left}');
@@ -453,7 +453,7 @@ export async function renderOilReportPage(env, code, keyQS) {
     const on = (r.n === 130) ? 'on' : '';
     h.push('<button data-n="' + r.n + '" class="' + on + '">' + r.k + '</button>');
   });
-  h.push('<span class="hint">Scroll to zoom · drag to pan · hover for O/H/L/C</span>');
+  h.push('<span class="hint">Scroll to zoom · drag to pan · hover or tap for O/H/L/C · pinch &amp; swipe on touch</span>');
   h.push('</div>');
   h.push('<svg id="chart" viewBox="0 0 ' + CHART_W + ' ' + CHART_H + '">' + initSvg + '</svg>');
   h.push('<div class="note" id="chartRange"></div>');
@@ -610,13 +610,14 @@ function inlineScript() {
     '  V.atEnd=(Math.round(V.i0f)+V.span>=total);',
     '  clearRangeBtns();drawChart();drawLegend();',
     '}',
-    'function panByPx(dx){',
+    'function panByPx(dx,noDraw){',
     '  var rows=effRows(CODE),total=rows.length;if(!total)return;',
     '  var g=geom();if(g.PW<=0)return;',
+    '  V.atEnd=false;',
     '  V.i0f-=dx/g.PW*(V.span-1);',
     '  clampView(total);',
     '  V.atEnd=(Math.round(V.i0f)+V.span>=total);',
-    '  drawChart();drawLegend();',
+    '  if(!noDraw){drawChart();drawLegend();}',
     '}',
     'function clearRangeBtns(){',
     '  var bs=document.querySelectorAll("#ranges button");',
@@ -789,13 +790,16 @@ function inlineScript() {
     '    var frac=(p.x-PL)/g.PW;',
     '    zoomAt(frac,e.deltaY>0?1.2:1/1.2);',
     '  },{passive:false});',
-    /* 触屏：单指平移 + 双指捏合缩放 */
+    /* 触屏：横滑平移 / 竖滑让页面滚动 / 单击选中 / 双指捏合缩放 */
     '  var tc=null;',
     '  function tdist(t){var dx=t[0].clientX-t[1].clientX,dy=t[0].clientY-t[1].clientY;',
     '    return Math.sqrt(dx*dx+dy*dy)||1}',
     '  svg.addEventListener("touchstart",function(e){',
-    '    if(e.touches.length===1){tc={m:1,x:e.touches[0].clientX}}',
-    '    else if(e.touches.length===2){',
+    '    if(e.touches.length===1){',
+    '      var t=e.touches[0];',
+    '      tc={m:1,x:t.clientX,y:t.clientY,sx:t.clientX,sy:t.clientY,',
+    '          moved:false,axis:""};',
+    '    }else if(e.touches.length===2){',
     '      var cx=(e.touches[0].clientX+e.touches[1].clientX)/2;',
     '      var r0=svg.getBoundingClientRect();',
     '      var g=geom();',
@@ -804,13 +808,21 @@ function inlineScript() {
     '  },{passive:true});',
     '  svg.addEventListener("touchmove",function(e){',
     '    if(!tc)return;',
-    '    e.preventDefault();',
     '    if(tc.m===1&&e.touches.length===1){',
-    '      var t=e.touches[0],dx=t.clientX-tc.x;tc.x=t.clientX;',
-    '      panByPx(dx);',
+    '      var t=e.touches[0],dx=t.clientX-tc.x,dy=t.clientY-tc.y;',
+    '      if(!tc.axis){',
+    '        var ax=Math.abs(t.clientX-tc.sx),ay=Math.abs(t.clientY-tc.sy);',
+    '        if(ax<6&&ay<6)return;',
+    '        tc.axis=(ax>=ay)?"x":"y";',
+    '      }',
+    '      if(tc.axis!=="x")return;',
+    '      e.preventDefault();',
+    '      tc.x=t.clientX;tc.y=t.clientY;tc.moved=true;',
+    '      panByPx(dx,true);',
     '      var r0=svg.getBoundingClientRect();',
     '      hoverAt({x:t.clientX-r0.left,y:t.clientY-r0.top});',
     '    }else if(tc.m===2&&e.touches.length===2){',
+    '      e.preventDefault();',
     '      var nd=tdist(e.touches);',
     '      var rows=effRows(CODE),total=rows.length;',
     '      var ns=Math.round(tc.span*(tc.d/nd));',
@@ -822,7 +834,15 @@ function inlineScript() {
     '      clearRangeBtns();drawChart();drawLegend();',
     '    }',
     '  },{passive:false});',
-    '  svg.addEventListener("touchend",function(e){if(e.touches.length===0)tc=null},{passive:true});',
+    '  svg.addEventListener("touchend",function(e){',
+    '    if(!tc)return;',
+    '    if(tc.m===1&&!tc.moved){',
+    '      var r0=svg.getBoundingClientRect();',
+    '      hoverAt({x:tc.sx-r0.left,y:tc.sy-r0.top});',
+    '    }',
+    '    if(e.touches.length===0)tc=null;',
+    '  },{passive:true});',
+    '  svg.addEventListener("touchcancel",function(){tc=null},{passive:true});',
     '  var rz=null;',
     '  window.addEventListener("resize",function(){',
     '    if(rz)clearTimeout(rz);',
