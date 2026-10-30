@@ -41,6 +41,29 @@ const FROZEN_DAYEND = 120;
 // 价格「真变化」阈值：源有微小抖动，休市时也可能跳 0.01%
 const CHANGE_EPS = 0.0001;
 
+// ============================================================
+// ★ B22：时间单位统一为「秒」
+// ------------------------------------------------------------
+// B18/B21 埋了个坑：三张表两种单位
+//     tick_min.ts          秒
+//     session_state.last_change_ts   毫秒  ← 不一样
+//     session_log.open_ts/close_ts   秒
+// 结果是去 D1 Studio 查的时候有的要 /1000 有的不要，迟早出错。
+// 本版起全部统一成 Unix 秒，并在建表时自动把老库的毫秒数据转成秒。
+// ============================================================
+
+/** 毫秒和秒的分界：1e11 秒 = 公元 5138 年，1e11 毫秒 = 1973 年 */
+const MS_THRESHOLD = 100000000000;
+
+/** Unix 秒 → 可读时间字符串。offsetHours=8 即北京时间。 */
+export function fmtTs(sec, offsetHours = 0) {
+  const s = Number(sec);
+  if (!isFinite(s) || s <= 0) return null;
+  const d = new Date(s * 1000 + offsetHours * 3600000);
+  // Workers 运行时 TZ 恒为 UTC，toISOString 一定是 UTC 基准，加偏移即可得目标时区
+  return d.toISOString().replace('T', ' ').slice(0, 19);
+}
+
 // ---- 建表（首次调用时执行，之后 IF NOT EXISTS 直接跳过）----
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS tick_min (
@@ -73,6 +96,11 @@ const SCHEMA = [
   //   纯属重复 —— 白占一倍存储、每次写入还要多维护一份。这里主动删掉
   //   （老库已建过的会被 DROP，新库 IF NOT EXISTS 直接跳过）。
   `DROP INDEX IF EXISTS idx_tick_min_code_ts;`,
+  // ★ B22 迁移：老库 last_change_ts 是毫秒，统一转成秒。
+  //   条件 > 1e11 保证只命中毫秒值（秒级现值约 1.7e9，永远 < 1e11）；
+  //   已经是秒的行不会被碰，所以重复执行安全；没匹配行时 rows written = 0。
+  `UPDATE session_state SET last_change_ts = CAST(last_change_ts / 1000 AS INTEGER)
+     WHERE last_change_ts > ${MS_THRESHOLD};`,
 ];
 
 // ---- 保留策略（天）----
@@ -107,11 +135,13 @@ export function isRealChange(oldP, newP) {
 
 /**
  * 由状态推出当前会话判定（纯函数，好测）。
+ * ★ B22：nowSec 和 st.last_change_ts 都是「秒」（B21 及以前这里用毫秒）
+ * @param {number} nowSec 当前 Unix 秒
  * @returns {{state:'open'|'closed', frozenMin:number, dayEnd:boolean}}
  */
-export function judgeFromState(st, nowMs) {
+export function judgeFromState(st, nowSec) {
   const frozenMin = st && st.last_change_ts
-    ? Math.floor((nowMs - Number(st.last_change_ts)) / 60000)
+    ? Math.floor((nowSec - Number(st.last_change_ts)) / 60)
     : 9999;
   let state;
   if (frozenMin <= FROZEN_TRADING) state = 'open';
@@ -144,15 +174,22 @@ export async function recordSample(env, code, price, src, now = new Date()) {
   if (!(await ensureSchema(env))) return null;
   const p = Number(price);
   if (!isFinite(p) || p <= 0) return null;
-  const nowMs = now.getTime();
-  const nowSec = Math.floor(nowMs / 1000);
+  const nowSec = Math.floor(now.getTime() / 1000);
   // 分钟取整，同一分钟重复调用覆盖同一行（幂等，不重复计费行数）
   const minSec = Math.floor(nowSec / 60) * 60;
 
   const st = await getState(env, code);
   const changed = !st || isRealChange(st.last_price, p);
 
-  // 写分钟采样
+  // ★ B22 兼容：万一还有老库残留的毫秒行，读进来先归一到秒，
+  //   否则冻结时长会算成巨大负数/天文数字，判定直接错乱。
+  const normTs = (v) => {
+    const n = Number(v);
+    if (!isFinite(n) || n <= 0) return 0;
+    return n > MS_THRESHOLD ? Math.floor(n / 1000) : Math.floor(n);
+  };
+
+  // 写分钟采样（tick_min.ts 一直是秒，不变）
   try {
     await env.DB.prepare(
       'INSERT INTO tick_min (code, ts, price, src) VALUES (?, ?, ?, ?) ' +
@@ -160,14 +197,14 @@ export async function recordSample(env, code, price, src, now = new Date()) {
     ).bind(code, minSec, p, src || null).run();
   } catch (e) { /* 采样失败不阻断判定 */ }
 
-  // ★ 两个时长要分开算：
+  // ★ 两个时长要分开算（B22：全部用秒，除以 60 得分钟）：
   //   frozenBefore = 本次之前已经冻结多久（用来判断「是不是真的收盘过」）
   //   j.state      = 本次之后的状态（价格刚动过就该是 open，不能还报 closed）
   const frozenBefore = st && st.last_change_ts
-    ? Math.floor((nowMs - Number(st.last_change_ts)) / 60000)
+    ? Math.floor((nowSec - normTs(st.last_change_ts)) / 60)
     : 9999;
-  const effTs = changed ? nowMs : (st ? Number(st.last_change_ts) : nowMs);
-  const j = judgeFromState({ ...(st || {}), last_change_ts: effTs }, nowMs);
+  const effTs = changed ? nowSec : (st ? normTs(st.last_change_ts) : nowSec);
+  const j = judgeFromState({ ...(st || {}), last_change_ts: effTs }, nowSec);
   let event = 'none';
 
   // ---- 重新开盘 ----
@@ -179,14 +216,14 @@ export async function recordSample(env, code, price, src, now = new Date()) {
     event = 'open';
   }
 
-  // 状态行 upsert
-  const prevDay = st && st.cur_day ? st.cur_day : dayOf(nowMs, code);
+  // 状态行 upsert（★ B22：last_change_ts 一律写秒）
+  const prevDay = st && st.cur_day ? st.cur_day : dayOf(nowSec, code);
   const next = {
     code,
     state: j.state,
-    last_change_ts: changed ? nowMs : (st ? Number(st.last_change_ts) : nowMs),
+    last_change_ts: changed ? nowSec : (st ? normTs(st.last_change_ts) : nowSec),
     last_price: p,
-    cur_day: event === 'open' ? dayOf(nowMs, code) : prevDay,
+    cur_day: event === 'open' ? dayOf(nowSec, code) : prevDay,
     day_open:  (event === 'open' || !st) ? p : Number(st.day_open ?? p),
     day_high:  (event === 'open' || !st) ? p : Math.max(Number(st.day_high ?? p), p),
     day_low:   (event === 'open' || !st) ? p : Math.min(Number(st.day_low ?? p), p),
@@ -224,7 +261,8 @@ export async function recordSample(env, code, price, src, now = new Date()) {
            VALUES (?,?,?,?,?,?,?,?,?)`
         ).bind(
           code, next.cur_day,
-          Math.floor(Number(next.last_change_ts) / 1000), nowSec,
+          // ★ B22：last_change_ts 已是秒，直接用（B21 这里还多除了一次 1000）
+          next.last_change_ts, nowSec,
           next.day_open, next.day_close, next.day_high, next.day_low, next.day_src
         ).run();
         event = 'close';
@@ -236,8 +274,9 @@ export async function recordSample(env, code, price, src, now = new Date()) {
 }
 
 /** 交易日（用市场本地日历，与现有报表口径保持一致） */
-function dayOf(nowMs, code) {
-  const d = new Date(nowMs);
+/** @param {number} nowSec Unix 秒（★ B22：B21 及以前这里收毫秒） */
+function dayOf(nowSec, code) {
+  const d = new Date(nowSec * 1000);
   const tz = code === 'wti' ? 'America/Chicago' : 'Europe/London';
   try {
     const s = new Intl.DateTimeFormat('en-CA', {
@@ -342,7 +381,9 @@ export async function sessionSnapshot(env, code, now = new Date()) {
   if (!(await ensureSchema(env))) return null;
   const st = await getState(env, code);
   if (!st) return null;
-  const j = judgeFromState(st, now.getTime());
+  // ★ B22：judgeFromState 收秒
+  const nowSec = Math.floor(now.getTime() / 1000);
+  const j = judgeFromState(st, nowSec);
   let logs = [];
   try {
     const r = await env.DB.prepare(
@@ -357,12 +398,17 @@ export async function sessionSnapshot(env, code, now = new Date()) {
     dayEnd: j.dayEnd,
     lastPrice: st.last_price,
     curDay: st.cur_day,
+    // ★ B22：全部补可读时间，省得去 Studio 写 SQL
+    now: { utc: fmtTs(nowSec, 0), beijing: fmtTs(nowSec, 8) },
+    lastChange: { utc: fmtTs(st.last_change_ts, 0), beijing: fmtTs(st.last_change_ts, 8) },
     day: {
       open: st.day_open, high: st.day_high, low: st.day_low, close: st.day_close,
     },
     recent: logs.map(l => ({
       day: l.day,
       openTs: l.open_ts, closeTs: l.close_ts,
+      openUtc: fmtTs(l.open_ts, 0), openBeijing: fmtTs(l.open_ts, 8),
+      closeUtc: fmtTs(l.close_ts, 0), closeBeijing: fmtTs(l.close_ts, 8),
       open: l.open_price, close: l.close_price, high: l.high, low: l.low,
     })),
   };
@@ -385,14 +431,84 @@ export async function dbStats(env) {
   const states = await q('SELECT COUNT(*) AS n FROM session_state');
   // 粗估：WITHOUT ROWID 行约 40 字节 + 页开销，按 64 字节/行保守计
   const bytes = Math.max(0, ticks) * 64 + Math.max(0, logs) * 96 + Math.max(0, states) * 160;
+
+  // ---- ★ B22：可读时间 ----
+  // 以前要在 D1 Studio 手写 SQL 才能看清时间，而且三张表单位还不统一
+  // （tick 是秒、state 是毫秒），一不留神就写错。这里直接算好返回。
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // tick_min 的采样时间跨度
+  let tickRange = null;
+  try {
+    const r = await env.DB.prepare(
+      'SELECT MIN(ts) AS a, MAX(ts) AS b, COUNT(*) AS n FROM tick_min'
+    ).first();
+    if (r && r.a != null && r.b != null) {
+      tickRange = {
+        count: Number(r.n || 0),
+        fromUtc: fmtTs(r.a, 0), fromBeijing: fmtTs(r.a, 8),
+        toUtc: fmtTs(r.b, 0), toBeijing: fmtTs(r.b, 8),
+        spanHours: Math.round((Number(r.b) - Number(r.a)) / 36) / 100,
+        freshnessSec: nowSec - Number(r.b),
+      };
+    }
+  } catch (e) { /* 表不存在等，忽略 */ }
+
+  // session_state 每行：状态 + 上次价格变动的可读时间
+  let stateRows = [];
+  try {
+    const r = await env.DB.prepare(
+      'SELECT code,state,last_change_ts,last_price,cur_day,' +
+      'day_open,day_high,day_low,day_close,day_src FROM session_state'
+    ).all();
+    stateRows = ((r && r.results) || []).map(x => ({
+      code: x.code,
+      state: x.state,
+      curDay: x.cur_day,
+      lastPrice: x.last_price,
+      lastChangeUtc: fmtTs(x.last_change_ts, 0),
+      lastChangeBeijing: fmtTs(x.last_change_ts, 8),
+      frozenMin: Math.floor((nowSec - Number(x.last_change_ts)) / 60),
+      day: {
+        open: x.day_open, high: x.day_high, low: x.day_low,
+        close: x.day_close, src: x.day_src,
+      },
+    }));
+  } catch (e) { /* 忽略 */ }
+
+  // session_log 最近 10 条：实测开收盘时刻
+  let recentSessions = [];
+  try {
+    const r = await env.DB.prepare(
+      'SELECT code,day,open_ts,close_ts,open_price,close_price,high,low,src ' +
+      'FROM session_log ORDER BY id DESC LIMIT 10'
+    ).all();
+    recentSessions = ((r && r.results) || []).map(l => ({
+      code: l.code,
+      day: l.day,
+      src: l.src,
+      openUtc: fmtTs(l.open_ts, 0), openBeijing: fmtTs(l.open_ts, 8),
+      closeUtc: fmtTs(l.close_ts, 0), closeBeijing: fmtTs(l.close_ts, 8),
+      open: l.open_price, close: l.close_price, high: l.high, low: l.low,
+    }));
+  } catch (e) { /* 忽略 */ }
+
   return {
+    ok: true,
+    // ★ 统一说明：所有 ts / *_ts 字段一律 Unix 秒
+    timeUnit: 'unix_seconds',
+    now: { unixSec: nowSec, utc: fmtTs(nowSec, 0), beijing: fmtTs(nowSec, 8) },
     rows: { tick_min: ticks, session_log: logs, session_state: states },
     estBytes: bytes,
     estMB: Math.round((bytes / 1048576) * 100) / 100,
     limitGB: 5,
     usedPct: Math.round((bytes / (5 * 1073741824)) * 10000) / 10000,
     keepTickDays: KEEP_TICK_DAYS,
-    note: 'tick_min 每天自动清到保留窗口；触及 5GB 后写入会直接失败（D1 不会自动删）',
+    tickRange,
+    states: stateRows,
+    recentSessions,
+    note: 'tick_min 每天自动清到保留窗口；触及 5GB 后写入会直接失败（D1 不会自动删）。' +
+          '所有 *_ts 均为 Unix 秒，Utc/Beijing 为换算好的可读时间。',
   };
 }
 
