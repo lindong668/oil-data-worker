@@ -855,32 +855,100 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
     if (url.pathname === '/gold/live') {
       if (!ok) return new Response(JSON.stringify({ error: 'forbidden' }),
         { status: 403, headers: JSON_HEADERS });
+
+      /* ★★ 写入放大修复（★ 这是 KV 额度被吃光的真正元凶，比黄金 cron 大得多）
+       *
+       * 原实现：每次被调用都 fetchGoldAndSave() —— 当场真抓三个源 + 写一次 KV。
+       *   2 号前端每 15 秒问一次 → 页面开着 4 小时就是 960 次写入，
+       *   一天 1000 的免费额度直接见底，之后所有写入 429 失败。
+       *   顺带把 3 号拖慢到超时，2 号拿不到价 → 前端只能直连国外源 → 连接中断。
+       *
+       * 现在三层节流：
+       *   ① 60 秒内已抓过 → 直接回缓存，不抓不写（绝大多数请求走这条）
+       *   ② 当日真抓次数到上限 → 也回缓存，但标注 live=false 让 2 号知道它不是新的
+       *   ③ 都没挡住才真抓，并给当日计数 +1 */
+      const cachedG = await env.OIL_KV.get('gold_data', 'json').catch(() => null);
+      const ageMs = (cachedG && cachedG.fetchedAtMs) ? (Date.now() - cachedG.fetchedAtMs) : Infinity;
+      const hasVal = !!(cachedG && cachedG.priceUsdPerOz);
+      const sendCached = (live, why, extra) =>
+        new Response(JSON.stringify(Object.assign({
+          ok: true,
+          live: live,                       // live=false 表示这是缓存值，不是刚抓的
+          cached: true,
+          ageMs: ageMs === Infinity ? null : ageMs,
+          why: why,
+          priceUsdPerOz: cachedG.priceUsdPerOz,
+          asOf: cachedG.updatedAt,
+          source: cachedG.fetchedFrom,
+          stale: cachedG.stale === true,
+          fetchedAtMs: cachedG.fetchedAtMs,
+        }, extra || {})), { headers: JSON_HEADERS });
+
+      if (hasVal && ageMs < GOLD_LIVE_CACHE_MS) {
+        return sendCached(true, 'fresh-cache');        /* ① 命中新鲜缓存 */
+      }
+
+      /* ② 每日真抓上限：防止少数访客把当天额度刷光 */
+      const capKey = 'gold_live_daily';
+      const today = beijingDateString();
+      const cap = await env.OIL_KV.get(capKey, 'json').catch(() => null);
+      const used = (cap && cap.day === today) ? (cap.n || 0) : 0;
+      if (used >= GOLD_LIVE_DAILY_CAP) {
+        if (hasVal) return sendCached(false, 'daily-cap', { capped: true, usedToday: used });
+        /* 缓存里也没有值 → 这种情况下必须抓，否则永远出不来数 */
+      } else {
+        try {
+          const r = await fetchGoldAndSave(env, { manual: false });
+          await env.OIL_KV.put(capKey, JSON.stringify({ day: today, n: used + 1 }),
+            { expirationTtl: 86400 * 3 }).catch(() => {});
+          const d = r.data;
+          return new Response(JSON.stringify({
+            ok: true,
+            live: true,
+            cached: false,
+            why: 'fresh-fetch',
+            usedToday: used + 1,
+            priceUsdPerOz: d.priceUsdPerOz,
+            asOf: d.updatedAt,
+            source: d.fetchedFrom,
+            stale: d.stale === true,
+            fetchedAtMs: Date.now(),
+          }), { headers: JSON_HEADERS });
+        } catch (e) {
+          if (hasVal) {
+            return new Response(JSON.stringify({
+              ok: false, live: false, cached: true, error: e.message,
+              fallback: {
+                priceUsdPerOz: cachedG.priceUsdPerOz,
+                asOf: cachedG.updatedAt,
+                source: cachedG.fetchedFrom,
+                note: '现抓失败，这是最后一次成功抓取的值（非实时）',
+              },
+            }), { headers: JSON_HEADERS });
+          }
+          return new Response(JSON.stringify({ ok: false, live: false, error: e.message }),
+            { headers: JSON_HEADERS });
+        }
+      }
+      /* 走到这里 = 超上限且缓存没值 → 兜底真抓一次（不加计数，保证能出数） */
       try {
         const r = await fetchGoldAndSave(env, { manual: false });
+
         const d = r.data;
         return new Response(JSON.stringify({
           ok: true,
-          live: true,                       // 明确告诉前端：这是现抓的，不是缓存
+          live: true,
+          cached: false,
+          why: 'cap-fallback-fetch',
           priceUsdPerOz: d.priceUsdPerOz,
           asOf: d.updatedAt,
-          source: d.fetchedFrom,            // xaus / biquote / gold-api
+          source: d.fetchedFrom,
           stale: d.stale === true,
           fetchedAtMs: Date.now(),
         }), { headers: JSON_HEADERS });
       } catch (e) {
-        // 现抓也失败 → 把最后一次成功值一并给回，但明确标注它不是新的
-        const c = await env.OIL_KV.get('gold_data', 'json').catch(() => null);
-        return new Response(JSON.stringify({
-          ok: false,
-          live: false,
-          error: e.message,
-          fallback: c ? {
-            priceUsdPerOz: c.priceUsdPerOz,
-            asOf: c.updatedAt,
-            source: c.fetchedFrom,
-            note: '现抓失败，这是最后一次成功抓取的值（非实时）',
-          } : null,
-        }), { headers: JSON_HEADERS });
+        return new Response(JSON.stringify({ ok: false, live: false, error: e.message }),
+          { headers: JSON_HEADERS });
       }
     }
 
@@ -1477,6 +1545,19 @@ const TROY_OZ_TO_GRAM = 31.1034768;
 const GOLD_TICK_MIN = 6;
 /* ★ 价格没变时最多攒多久必须强制写一次（分钟）—— 防止 key 过期 */
 const GOLD_FORCE_WRITE_MIN = 60;
+/* ★ /gold/live 的三层节流参数（见 fetch() 里 /gold/live 分支）
+ *   GOLD_LIVE_CACHE_MS   —— 这个值多少秒内算"新鲜"，直接回缓存不真抓
+ *   GOLD_LIVE_DAILY_CAP  —— 每天最多真抓几次（真抓 = 打三个源 + 写一次 KV） */
+const GOLD_LIVE_CACHE_MS = 60000;   /* 60 秒 */
+const GOLD_LIVE_DAILY_CAP = 200;    /* 200 次/天 */
+/* 额度账（免费版 1,000 次/天，两个站共用同一个 KV）：
+ *   黄金 cron（*/6）        240 次（价不变自动跳过，实际更少）
+ *   /gold/live 真抓        ≤ 200 次
+ *   /gold/live 计数写入    ≤ 200 次
+ *   原油 + 历史 + 国内油价  ≈  48 次
+ *   3 号小计               ≤ 688 次
+ *   2 号（休市状态每10分钟）  144 次
+ *   合计                   ≈ 832 次，留约 17% 余量 */
 
 // ============================================================
 // 黄金自建日线（开/高/低/收）—— 与原油同一套思路
