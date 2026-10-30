@@ -69,20 +69,23 @@ id = "af76a1d05d444244a468ed02d6617f98"
 #   KV 免费版 1,000 次写入/天装不下（3 分钟粒度 960 次/天直接爆），
 #   D1 免费版 10 万 rows written/天，960 行只占 1%。
 #
-# ★ 下面这段默认是注释掉的 —— 因为 database_id 必须你建库后才有。
-#   不建也能正常部署：代码里 env.DB 不存在时全部静默跳过，
-#   开收盘仍走原来的时区推算，只是没有自建兜底。
+# ★ 字段名必须是 database_id，不是 id。
+#   wrangler 4.x 遇到 id 会警告「Unexpected fields ... "id"」并整段忽略，
+#   于是它继续用你仓库里【旧的那条】绑定去连库 —— 就是部署日志里
+#   f8fe65e8-... could not be found [7404] 的来源：
+#   那个库在 CF 后台已经查不到了（你在控制台只看到 ou 一个库）。
 #
-# 启用三步：
-#   ① 建库   npx wrangler d1 create oil-session
-#            （或在 CF 后台 → Workers KV 旁边的 D1 → Create）
-#   ② 建库后终端会给出 database_id，把它填进下面的 id = "..."
-#   ③ 去掉下面 4 行的 # 号，push 一次
+# ⚠️ 检查一件事：本文件里只允许存在【一个】 [[d1_databases]] 段。
+#   如果你仓库的 wrangler.toml 里本来就有一段指向 f8fe65e8-...，
+#   请整段删掉（4 行全删），只保留下面这段。
+#
+# 不建库也能部署：env.DB 不存在时代码全部静默跳过，
+# 开收盘仍走原来的时区推算，只是没有自建兜底。
 #
 [[d1_databases]]
 binding = "DB"
 database_name = "ou"
-id = "ea463ee9-78e4-481a-842d-5138beca8b70"
+database_id = "ea463ee9-78e4-481a-842d-5138beca8b70"
 #
 # 建表不用你管：代码首次调用时自动 CREATE TABLE IF NOT EXISTS。
 #

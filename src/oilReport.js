@@ -484,7 +484,7 @@ export async function renderOilReportPage(env, code, keyQS) {
   h.push('var LIVE={brent:' + (initBrent || 0) + ',wti:' + (initWti || 0) + '};');
   h.push('var H=' + CHART_H + ';');
   h.push('var V={i0f:0,span:130,atEnd:true,hover:-1,hoverY:-1};');
-  h.push('var ALL=false,SEL_Y="all",SEL_M="all";');
+  h.push('var ALL=false,SEL_Y="all",SEL_M="all",TLIM=30;');
   h.push(inlineScript());
   h.push('</script>');
 
@@ -665,8 +665,7 @@ function inlineScript() {
     'function drawTable(){',
     '  var all=DATA[CODE]||[];',
     '  var idxs=filteredIdx(),total=all.length;',
-    '  var filt=(SEL_Y!="all"||SEL_M!="all");',
-    '  var lim=filt?idxs.length:(ALL?idxs.length:60);',
+    '  var lim=ALL?idxs.length:Math.min(idxs.length,TLIM);',
     '  var h="",i,k,ii,r,prev,close,hi,lo,d,cls,sign;',
     '  for(i=0;i<idxs.length&&i<lim;i++){',
     '    ii=idxs[i];r=all[ii];',
@@ -682,10 +681,10 @@ function inlineScript() {
     '  }',
     '  document.querySelector("#tbl tbody").innerHTML=h;',
     '  var tc=document.getElementById("tcount");',
-    '  if(tc)tc.textContent=idxs.length+" trading days"+(idxs.length>lim?" (showing first "+lim+")":"");',
+    '  if(tc)tc.textContent=idxs.length+" trading days"+(idxs.length>lim?" (latest "+lim+")":"");',
     '  var btn=document.getElementById("more");',
     '  if(btn){',
-    '    btn.style.display=(!filt&&idxs.length>60)?"block":"none";',
+    '    btn.style.display=(idxs.length>TLIM)?"block":"none";',
     '    btn.textContent=ALL?"Collapse ▲":"Show all ("+idxs.length+" trading days) ▼";',
     '  }',
     '}',
