@@ -1,5 +1,6 @@
 import { SEED_BRENT, SEED_WTI } from './seed.js';
 import { fetchTick, renderOilReportPage } from './oilReport.js';   /* ★ B13 原油秒级专页 */
+import { recordSample, sessionSnapshot, aggregateFromMinutes, pruneMinutes } from './session.js'; /* ★ B18 自建开收盘判定 */
 
 /**
  * oil-data-worker  v8
@@ -984,6 +985,39 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
       return new Response(JSON.stringify(t), { headers: JSON_HEADERS });
     }
 
+    // ---------------- /session 自建开收盘判定（B18）----------------
+    // 看我们自己判的市场状态：open/closed、冻结多少分钟、当日自建 OHLC、
+    // 最近几次开盘/收盘的实际时刻（用来核对到底几点开几点收）。
+    if (url.pathname === '/session') {
+      if (!ok) {
+        return new Response(JSON.stringify({ error: 'forbidden' }), {
+          status: 403, headers: JSON_HEADERS,
+        });
+      }
+      const sc = url.searchParams.get('code');
+      const codes = sc === 'wti' ? ['wti'] : (sc === 'brent' ? ['brent'] : ['brent', 'wti']);
+      const snap = {};
+      for (const c of codes) snap[c] = await sessionSnapshot(env, c, new Date());
+      return new Response(JSON.stringify({
+        ok: true,
+        hasD1: !!(env && env.DB),
+        note: 'state 由「价格冻结时长」判定，不依赖时区推算；open_ts/close_ts 是实测出来的开收时刻',
+        data: snap,
+      }, null, 2), { headers: JSON_HEADERS });
+    }
+
+    // ---------------- /prune-minutes 手动清理旧采样（B18）----------------
+    if (url.pathname === '/prune-minutes') {
+      if (!ok) {
+        return new Response(JSON.stringify({ error: 'forbidden' }), {
+          status: 403, headers: JSON_HEADERS,
+        });
+      }
+      const out = {};
+      for (const c of ['brent', 'wti']) out[c] = await pruneMinutes(env, c, 7);
+      return new Response(JSON.stringify({ ok: true, deleted: out }, null, 2), { headers: JSON_HEADERS });
+    }
+
     // ---------------- /oil-report 原油秒级专页 ----------------
     // ★ B13：布伦特 + WTI 实时卡（3 秒跳）+ 走势曲线 + 历史日线报表
     if (url.pathname === '/oil-report' || url.pathname === '/oil') {
@@ -1234,10 +1268,13 @@ ${histDetail}
 
     if (isGoldTick) {
       jobs.push(fetchGoldAndSave(env, { manual: false }));
+      /* ★ B18：顺手记一笔原油分钟采样，给开收盘判定攒底账。
+         与黄金共用这一拍，不额外占 cron；写的是 D1 不是 KV，不碰写入配额。 */
+      jobs.push(recordOilMinutes(env));
       console.log(`[cron] 黄金抓取 — 北京 ${h}:${String(min).padStart(2, '0')}，每 3 分钟一次`);
       if (!jobs.length) return;
       await Promise.allSettled(jobs);
-      return;                                    // ★ 只跑黄金，绝不碰原油
+      return;                                    // ★ 只跑黄金 + 原油采样，不跑原油主抓取
     }
 
     /* ★ 下面原油 + 国内油价：只在 "5,20" 这条 cron 上执行，与 B7 逐行一致。 */
@@ -1695,7 +1732,7 @@ async function applyDailyBar(env, code, bar) {
   row.open = bar.open; row.high = bar.high; row.low = bar.low; row.close = bar.close;
   if (bar.volume != null) row.volume = bar.volume;
   row.samples = null;
-  row.src = 'import';
+  row.src = bar.src || 'import';     /* ★ B18：'self' = 自建分钟数据兜底 */
   row.settled = true;
   recomputeDiff(rows);
   const kept = rows.slice(-HISTORY_MAX_ROWS);
@@ -1709,6 +1746,29 @@ async function applyDailyBar(env, code, bar) {
  * 收盘后统一调度（由 "5,20" cron 调用，也可手动 /settle-daily）。
  * 只在「该品种当前不在交易中」时才动手，避免把盘中残缺 bar 当收盘价钉死。
  */
+/**
+ * ★ B18：记一笔原油分钟采样（自建开收盘底账）
+ *
+ * 挂在已有的「每 3 分钟」那条 cron 上，不新增 cron 条目 —— 免费版每个 Worker 最多 3 条，
+ * 现在「5,20」与「每 3 分钟」已占 2 条，只剩 1 条余量，要留给将来。
+ *
+ * 一天 480 次 × 2 品种 = 960 行，占 D1 免费版 10 万 rows written 的 1%。
+ * env.DB 没绑定时 recordSample 直接返回 null，零副作用。
+ */
+async function recordOilMinutes(env) {
+  if (!env || !env.DB) return null;
+  try {
+    const t = await fetchTick();
+    if (!t || !t.ok) return null;
+    const out = {};
+    if (t.brent) out.brent = await recordSample(env, 'brent', t.brent, t.provider, new Date());
+    if (t.wti) out.wti = await recordSample(env, 'wti', t.wti, t.provider, new Date());
+    return out;
+  } catch (e) {
+    return null;                     // 采样失败绝不能影响同批次的黄金抓取
+  }
+}
+
 async function runDailySettle(env, now = new Date()) {
   const out = {};
   for (const code of ['brent', 'wti']) {
@@ -1727,7 +1787,23 @@ async function runDailySettle(env, now = new Date()) {
     if (!cur && !tgt.weekdayOk) { out[code] = { skip: 'weekend-no-row', day }; continue; }
 
     const bar = await fetchYahooDailyBar(isWti ? 'CL=F' : 'BZ=F', day);
-    if (!bar) { out[code] = { skip: 'no-bar', day }; continue; }
+    if (!bar) {
+      /* ★ B18 兜底：Yahoo 拿不到官方日线（源挂了 / 被限流 / 当日没出 bar），
+         就用我们自己攒的分钟采样聚合出 OHLC —— 虽然精度不如交易所口径，
+         但总比这一天在报表里空着强。env.DB 没绑定时 aggregate 返回 null，
+         行为与改动前完全一致。 */
+      const self = await aggregateFromMinutes(env, code, day);
+      if (self && self.open != null) {
+        const r = await applyDailyBar(env, code, {
+          day: day, open: self.open, high: self.high,
+          low: self.low, close: self.close, src: 'self',
+        });
+        out[code] = Object.assign({}, r, { fallback: 'self-minutes' });
+      } else {
+        out[code] = { skip: 'no-bar', day };
+      }
+      continue;
+    }
     out[code] = await applyDailyBar(env, code, bar);
   }
   return out;
