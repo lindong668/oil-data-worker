@@ -1221,8 +1221,12 @@ ${histDetail}
      *   故 min % 6 能 100% 分开，不会误判（6 与 {5,20} 不重叠）。
      */
     const cronSpec = (controller && controller.cron) ? String(controller.cron) : '';
+    /* ★ 只认"是不是黄金那条 cron"，不写死间隔分钟数：
+     *   黄金 = 每 N 分钟形式（不含逗号），原油 = "5,20"（含逗号）。
+     *   这样即使 wrangler.toml 还没换成每 6 分钟、仍是每 3 分钟，
+     *   分流依然 100% 正确，不会出现"两条 cron 撞车、原油被多跑"的情况。 */
     const isGoldTick = cronSpec
-      ? cronSpec.indexOf('*/6') !== -1          // 明确来自黄金那条
+      ? (cronSpec.indexOf(',') === -1)          // 无逗号 = */N = 黄金那条
       : (min % 6 === 0);                        // 兜底：按分钟分流
     /* ★ 为什么是 6 而不是 5：原油那条 cron 在 :05 与 :20 触发，
      *   5 和 20 都是 5 的倍数 —— 若黄金用「每 5 分钟」，两条 cron 会撞车，
