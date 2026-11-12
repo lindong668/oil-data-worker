@@ -64,6 +64,29 @@ export function fmtTs(sec, offsetHours = 0) {
   return d.toISOString().replace('T', ' ').slice(0, 19);
 }
 
+/**
+ * ★ B23：判定规则原文 —— 接口直接吐出去，不用再去翻代码。
+ * 判了个 closed 却不告诉人家凭什么，等于没判。
+ */
+export const RULE = {
+  basis: '价格冻结时长（不看时钟）',
+  why: '市场开着就不断有新成交、价格会变；关了源就一直返回沿用值、价格冻结。' +
+       '所以「冻结多久」≈「关了多久」。冬夏令时自动跟随、交易所假日自动识别、临时停盘也抓得到。',
+  frozenTradingMin: FROZEN_TRADING,
+  frozenClosedMin: FROZEN_CLOSED,
+  frozenDayEndMin: FROZEN_DAYEND,
+  changeEps: CHANGE_EPS,
+  explain:
+    `冻结 ≤${FROZEN_TRADING} 分钟 → open；` +
+    `${FROZEN_TRADING}~${FROZEN_CLOSED} 分钟防抖区，保持上一状态不翻转；` +
+    `>${FROZEN_CLOSED} 分钟 → closed；` +
+    `>${FROZEN_DAYEND} 分钟 → 认定日收盘/周末（不是日内结算窗口）`,
+  caveat:
+    `判定天生滞后：价格停在第 0 分钟，要等冻结超过 ${FROZEN_CLOSED} 分钟才翻 closed、` +
+    `超过 ${FROZEN_DAYEND} 分钟才落库认定。所以「认定的时刻」比「市场实际停的时刻」晚，` +
+    `看时刻要认 close_ts，不要认 detected_ts。`,
+};
+
 // ---- 建表（首次调用时执行，之后 IF NOT EXISTS 直接跳过）----
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS tick_min (
@@ -103,6 +126,22 @@ const SCHEMA = [
      WHERE last_change_ts > ${MS_THRESHOLD};`,
 ];
 
+// ---- ★ B23 迁移：session_log 加 detected_ts 列 ----
+// 为什么必须加：
+//   B22 及以前写 log 时 close_ts 记的是「我们认定收盘的那一刻」，
+//   而判定要等冻结超过 120 分钟才落 —— 于是真实 05:00 停盘，
+//   log 里却记成 07:00，永远查不到市场实际几点休市。
+//   现在拆成两个：close_ts = 真实最后一笔成交，detected_ts = 我们认定的时刻。
+//
+// SQLite 的 ALTER TABLE ADD COLUMN 不支持 IF NOT EXISTS，
+// 列已存在会抛 "duplicate column name"，所以单独出来用 try/catch 吞掉。
+const MIGRATIONS = [
+  `ALTER TABLE session_log ADD COLUMN detected_ts INTEGER;`,
+];
+
+/** ★ B23：纳入自建开收盘判定的品种（黄金本版起加入，原来只有原油两支） */
+export const CODES = ['brent', 'wti', 'gold'];
+
 // ---- 保留策略（天）----
 // 分钟采样只用于「判定开收盘 + 当日兜底 OHLC」，用完就该扔。
 // 留 7 天足够覆盖一个完整交易周 + 周末，再多就是纯占空间。
@@ -117,6 +156,10 @@ async function ensureSchema(env) {
   if (schemaReady) return true;
   try {
     for (const sql of SCHEMA) await env.DB.prepare(sql).run();
+    // ★ B23：补列。每条单独 try，列已存在就跳过，绝不影响主流程。
+    for (const sql of MIGRATIONS) {
+      try { await env.DB.prepare(sql).run(); } catch (e) { /* 列已存在 */ }
+    }
     schemaReady = true;
     return true;
   } catch (e) {
@@ -256,13 +299,18 @@ export async function recordSample(env, code, price, src, now = new Date()) {
         'SELECT id FROM session_log WHERE code = ? AND day = ? LIMIT 1'
       ).bind(code, next.cur_day).first();
       if (!dup) {
+        // ★ B23：开/收时刻从当天 tick 反推，不再拿「当前时间」充数。
+        //   close_ts  = 当天最后一次价格真变 → 市场实际休市时刻
+        //   detected_ts = 我们认定收盘的时刻（按阈值比 close_ts 晚约 2 小时）
+        const b = await dayTickBounds(env, code, next.cur_day);
+        const openTs = b ? b.firstTs : next.last_change_ts;
+        const closeTs = b ? b.lastChangeTs : next.last_change_ts;
         await env.DB.prepare(
-          `INSERT INTO session_log (code,day,open_ts,close_ts,open_price,close_price,high,low,src)
-           VALUES (?,?,?,?,?,?,?,?,?)`
+          `INSERT INTO session_log (code,day,open_ts,close_ts,detected_ts,open_price,close_price,high,low,src)
+           VALUES (?,?,?,?,?,?,?,?,?,?)`
         ).bind(
           code, next.cur_day,
-          // ★ B22：last_change_ts 已是秒，直接用（B21 这里还多除了一次 1000）
-          next.last_change_ts, nowSec,
+          openTs, closeTs, nowSec,
           next.day_open, next.day_close, next.day_high, next.day_low, next.day_src
         ).run();
         event = 'close';
@@ -277,7 +325,10 @@ export async function recordSample(env, code, price, src, now = new Date()) {
 /** @param {number} nowSec Unix 秒（★ B22：B21 及以前这里收毫秒） */
 function dayOf(nowSec, code) {
   const d = new Date(nowSec * 1000);
-  const tz = code === 'wti' ? 'America/Chicago' : 'Europe/London';
+  // ★ B23：黄金按纽约日历（原来只有 brent/wti 两支，gold 会误落到伦敦）
+  const tz = code === 'wti' ? 'America/Chicago'
+    : code === 'gold' ? 'America/New_York'
+    : 'Europe/London';
   try {
     const s = new Intl.DateTimeFormat('en-CA', {
       timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
@@ -285,6 +336,51 @@ function dayOf(nowSec, code) {
     if (s) return s;
   } catch (e) { /* 兜底 */ }
   return d.toISOString().slice(0, 10);
+}
+
+/**
+ * ★ B23：从分钟采样反推某个交易日的真实边界时刻。
+ *
+ * 为什么需要：recordSample 是逐次无状态调用，写 log 那一刻只认得「当前时间」，
+ *   认不出当天第一笔成交是几点、最后一笔成交是几点 —— 而这两件事恰恰就是
+ *   「几点开盘 / 几点休市」的答案。B22 及以前拿当前时间充数，所以查不到真值。
+ *
+ * 注意区分「最后一个 tick」和「最后一笔成交」：
+ *   休市期间源仍在推沿用值，tick 照写但价格不动。
+ *   所以要逐点比较，找出最后一次「价格真的变了」的时刻。
+ *
+ * ⚠ tick_min 只保留 7 天，超出窗口返回 null（不是报错，是这个口径查不到）。
+ *
+ * @returns {null|{firstTs,lastTs,lastChangeTs,count,changes}}
+ */
+export async function dayTickBounds(env, code, day) {
+  if (!(await ensureSchema(env))) return null;
+  try {
+    const r = await env.DB.prepare(
+      'SELECT ts, price FROM tick_min WHERE code = ? ORDER BY ts'
+    ).bind(code).all();
+    const all = (r && r.results) || [];
+    // 用与写入时同一个 dayOf 口径过滤，保证交易日归属完全一致
+    const rows = all
+      .filter(x => dayOf(Number(x.ts), code) === day)
+      .map(x => ({ ts: Number(x.ts), price: Number(x.price) }));
+    if (!rows.length) return null;
+    let lastChangeTs = rows[0].ts;
+    let changes = 0;
+    for (let i = 1; i < rows.length; i++) {
+      if (isRealChange(rows[i - 1].price, rows[i].price)) {
+        lastChangeTs = rows[i].ts;
+        changes++;
+      }
+    }
+    return {
+      firstTs: rows[0].ts,
+      lastTs: rows[rows.length - 1].ts,
+      lastChangeTs,
+      count: rows.length,
+      changes,
+    };
+  } catch (e) { return null; }
 }
 
 /**
@@ -367,7 +463,8 @@ export async function pruneLogs(env, keepDays = KEEP_LOG_DAYS) {
 export async function runRetention(env) {
   if (!(await ensureSchema(env))) return null;
   const out = {};
-  for (const c of ['brent', 'wti']) {
+  // ★ B23：黄金也进来了，一起清（原来只清原油两支）
+  for (const c of CODES) {
     out[c] = {
       ticks: await pruneMinutes(env, c, KEEP_TICK_DAYS),
     };
@@ -387,13 +484,14 @@ export async function sessionSnapshot(env, code, now = new Date()) {
   let logs = [];
   try {
     const r = await env.DB.prepare(
-      'SELECT day,open_ts,close_ts,open_price,close_price,high,low FROM session_log WHERE code = ? ORDER BY id DESC LIMIT 5'
+      'SELECT day,open_ts,close_ts,detected_ts,open_price,close_price,high,low FROM session_log WHERE code = ? ORDER BY id DESC LIMIT 5'
     ).bind(code).all();
     logs = (r && r.results) || [];
   } catch (e) { /* 忽略 */ }
   return {
     code,
     state: j.state,
+    rule: RULE,
     frozenMin: j.frozenMin,
     dayEnd: j.dayEnd,
     lastPrice: st.last_price,
@@ -406,11 +504,90 @@ export async function sessionSnapshot(env, code, now = new Date()) {
     },
     recent: logs.map(l => ({
       day: l.day,
-      openTs: l.open_ts, closeTs: l.close_ts,
+      openTs: l.open_ts, closeTs: l.close_ts, detectedTs: l.detected_ts,
       openUtc: fmtTs(l.open_ts, 0), openBeijing: fmtTs(l.open_ts, 8),
       closeUtc: fmtTs(l.close_ts, 0), closeBeijing: fmtTs(l.close_ts, 8),
+      detectedUtc: fmtTs(l.detected_ts, 0), detectedBeijing: fmtTs(l.detected_ts, 8),
       open: l.open_price, close: l.close_price, high: l.high, low: l.low,
     })),
+  };
+}
+
+/**
+ * ★ B23：回溯某交易日的判定依据 —— 「它凭什么说休市了」。
+ *
+ * 光给结论（state=closed）没法核对。得把过程摊开：
+ *   最后一笔成交是几点 → 多久后翻 closed → 多久后认定日收盘 → log 里实际记了什么。
+ *
+ * @param {string} day 交易日（市场本地日历，如 2026-10-30）
+ */
+export async function traceDay(env, code, day, now = new Date()) {
+  if (!(await ensureSchema(env))) return null;
+  const b = await dayTickBounds(env, code, day);
+
+  let logged = null;
+  try {
+    const r = await env.DB.prepare(
+      'SELECT day,open_ts,close_ts,detected_ts,open_price,close_price,high,low,src ' +
+      'FROM session_log WHERE code = ? AND day = ? LIMIT 1'
+    ).bind(code, day).first();
+    if (r) logged = r;
+  } catch (e) { /* 老库可能还没加 detected_ts 列，忽略 */ }
+
+  const t = (ts) => {
+    const n = Number(ts);
+    return (isFinite(n) && n > 0) ? { utc: fmtTs(n, 0), beijing: fmtTs(n, 8) } : null;
+  };
+  const lastTradeTs = b ? b.lastChangeTs : (logged ? Number(logged.close_ts) : null);
+
+  // 判定时点：从最后一笔成交按阈值往前推。这是「我们什么时候会翻牌」，
+  // 不是「市场什么时候停的」—— 两者要分开看，不然会以为市场 07:00 才收盘。
+  const timeline = lastTradeTs ? {
+    lastTradeAt: t(lastTradeTs),
+    stateTurnsClosedAt: t(lastTradeTs + FROZEN_CLOSED * 60),
+    dayEndConfirmedAt: t(lastTradeTs + FROZEN_DAYEND * 60),
+    note: 'lastTradeAt 才是市场实际停止成交的时刻；' +
+          '后两个是按阈值推算的「我们什么时候翻牌」，天生滞后',
+  } : null;
+
+  let verdict;
+  if (logged && logged.close_ts) {
+    verdict = `已认定日收盘：市场最后一笔成交 ${t(logged.close_ts).beijing}（北京），` +
+              `我们在 ${t(logged.detected_ts).beijing}（北京）判定成立` +
+              `（滞后 ${Math.round((Number(logged.detected_ts) - Number(logged.close_ts)) / 60)} 分钟）。`;
+  } else if (lastTradeTs) {
+    verdict = `还没落库认定：最后一笔成交 ${t(lastTradeTs).beijing}（北京），` +
+              `冻结需超过 ${FROZEN_DAYEND} 分钟才写 session_log，` +
+              `即约 ${t(lastTradeTs + FROZEN_DAYEND * 60).beijing}（北京）。`;
+  } else {
+    verdict = `查不到该日数据：tick_min 只保留 ${KEEP_TICK_DAYS} 天，可能已超窗口，或该品种从未采样过。`;
+  }
+
+  return {
+    code, day,
+    rule: RULE,
+    samples: b ? {
+      count: b.count,
+      changes: b.changes,
+      first: t(b.firstTs),
+      last: t(b.lastTs),
+      note: 'count=采样点数，changes=其中价格真变过的次数。' +
+            '休市时源仍在推沿用值，所以 count 通常远大于 changes',
+    } : {
+      count: 0,
+      note: `tick_min 只保留 ${KEEP_TICK_DAYS} 天，该日已超出窗口，只能看 session_log`,
+    },
+    timeline,
+    logged: logged ? {
+      day: logged.day,
+      open: t(logged.open_ts),
+      close: t(logged.close_ts),
+      detected: t(logged.detected_ts),
+      openPrice: logged.open_price, closePrice: logged.close_price,
+      high: logged.high, low: logged.low, src: logged.src,
+      note: 'close=市场实际休市时刻；detected=我们认定收盘的时刻。看休市几点认 close，不要认 detected',
+    } : null,
+    verdict,
   };
 }
 
@@ -480,7 +657,7 @@ export async function dbStats(env) {
   let recentSessions = [];
   try {
     const r = await env.DB.prepare(
-      'SELECT code,day,open_ts,close_ts,open_price,close_price,high,low,src ' +
+      'SELECT code,day,open_ts,close_ts,detected_ts,open_price,close_price,high,low,src ' +
       'FROM session_log ORDER BY id DESC LIMIT 10'
     ).all();
     recentSessions = ((r && r.results) || []).map(l => ({
@@ -489,6 +666,9 @@ export async function dbStats(env) {
       src: l.src,
       openUtc: fmtTs(l.open_ts, 0), openBeijing: fmtTs(l.open_ts, 8),
       closeUtc: fmtTs(l.close_ts, 0), closeBeijing: fmtTs(l.close_ts, 8),
+      detectedUtc: fmtTs(l.detected_ts, 0), detectedBeijing: fmtTs(l.detected_ts, 8),
+      lagMin: (l.detected_ts && l.close_ts)
+        ? Math.round((Number(l.detected_ts) - Number(l.close_ts)) / 60) : null,
       open: l.open_price, close: l.close_price, high: l.high, low: l.low,
     }));
   } catch (e) { /* 忽略 */ }
@@ -504,6 +684,9 @@ export async function dbStats(env) {
     limitGB: 5,
     usedPct: Math.round((bytes / (5 * 1073741824)) * 10000) / 10000,
     keepTickDays: KEEP_TICK_DAYS,
+    // ★ B23：纳入实测判定的品种（黄金本版起加入）
+    codes: CODES,
+    rule: RULE,
     tickRange,
     states: stateRows,
     recentSessions,

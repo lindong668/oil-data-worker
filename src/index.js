@@ -1,6 +1,14 @@
 import { SEED_BRENT, SEED_WTI } from './seed.js';
-import { fetchTick, renderOilReportPage } from './oilReport.js';   /* ★ B13 原油秒级专页 */
-import { recordSample, sessionSnapshot, aggregateFromMinutes, pruneMinutes, runRetention, dbStats, KEEP_TICK_DAYS } from './session.js'; /* ★ B18 自建开收盘判定 */
+import { fetchTick, fetchTickFallback, TICK_SOURCES, renderOilReportPage } from './oilReport.js';   /* ★ B13 原油秒级专页 / ★ B24 补齐多源 */
+import { recordSample, sessionSnapshot, aggregateFromMinutes, pruneMinutes, runRetention, dbStats, KEEP_TICK_DAYS, traceDay, CODES } from './session.js'; /* ★ B18 自建开收盘判定 / ★ B23 黄金纳入 + 判定依据回溯 */
+
+/* ★ B24：独立链路兜底结果缓存。
+ * /api/oil-tick 每 3 秒被问一次，绝不能每拍都并发 5 条外网源。
+ * 只有 hf 全灭 / 价龄异常（疑似冻结）才最多每 30 秒跑一次，结果复用。 */
+let __fbCache = null, __fbAt = 0;
+const FB_MIN_GAP_MS = 30000;
+const HF_STUCK_SEC = 120;      // 3 分钟无新成交 = 疑似卡住
+const HF_CLOSED_SEC = 1200;   // 与 oilReport.js 的 CLOSED_AGE_SEC 一致；真休市不白跑
 
 /**
  * oil-data-worker  v8
@@ -975,14 +983,83 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
     // ★ B13：现抓新浪/腾讯并立刻返回，【不写 KV】。
     //   浏览器每 3 秒问一次即可达到秒级新鲜度，同时 KV 写入量为 0
     //   （KV 免费版 1,000 次/天，3 秒一拍会超出近 29 倍）。
+    // ★ B24：hf 四路同源，链路一冻就全是沿用值。补 5 条独立链路，
+    //   只在「全灭」或「价龄疑似卡住但未确认休市」时启用，30 秒缓存。
     if (url.pathname === '/api/oil-tick') {
       if (!ok) {
         return new Response(JSON.stringify({ error: 'forbidden' }), {
           status: 403, headers: JSON_HEADERS,
         });
       }
-      const t = await fetchTick();
-      return new Response(JSON.stringify(t), { headers: JSON_HEADERS });
+      const t = await fetchTick().catch(() => ({ ok: false }));
+      const age = t && t.ageSec != null ? t.ageSec : null;
+      const needFb = !t || !t.ok ||
+        (age != null && age > HF_STUCK_SEC && age < HF_CLOSED_SEC);
+      const nowMs = Date.now();
+      if (needFb && nowMs - __fbAt > FB_MIN_GAP_MS) {
+        __fbAt = nowMs;
+        __fbCache = await fetchTickFallback().catch(() => null);
+      }
+      const out = (t && t.ok) ? Object.assign({}, t) : { ok: false };
+      if (__fbCache && __fbCache.ok) {
+        if (!out.brent) out.brent = __fbCache.brent;
+        if (!out.wti) out.wti = __fbCache.wti;
+        out.ok = true;
+        out.fallback = __fbCache.provider;
+        if (!out.asOf) out.asOf = __fbCache.asOf;
+      }
+      out.sources = TICK_SOURCES;
+      return new Response(JSON.stringify(out), { headers: JSON_HEADERS });
+    }
+
+    // ---------------- /tick-debug 逐源诊断（B24）----------------
+    // 一次看清 9 条链路各自成没成、报了什么价。不写 KV、不改数据。
+    if (url.pathname === '/tick-debug') {
+      if (!ok) {
+        return new Response(JSON.stringify({ error: 'forbidden' }), {
+          status: 403, headers: JSON_HEADERS,
+        });
+      }
+      const hf = await fetchTick().catch(e => ({ ok: false, error: String(e && e.message || e) }));
+      const fb = await fetchTickFallback().catch(e => ({ ok: false, error: String(e && e.message || e) }));
+      return new Response(JSON.stringify({
+        at: new Date().toISOString(),
+        intervalMs: 3000,
+        sources: TICK_SOURCES,
+        hf, fallback: fb,
+        hint: 'hf.ageSec 落在 120~1200 且价格不动 = 新浪/腾讯链路冻结；' +
+              'fallback 有价 = 独立链路可用；两边都冻结才是真休市',
+      }, null, 2), { headers: JSON_HEADERS });
+    }
+
+    // ---------------- /history-debug 日线来源回溯（B24）----------------
+    // 把最近 14 行的来源与「是否与前一日同价」摊开，用来定案
+    // 「连续两天 close 一样」到底是官方日线、自建兜底，还是冻结价。
+    if (url.pathname === '/history-debug') {
+      if (!ok) {
+        return new Response(JSON.stringify({ error: 'forbidden' }), {
+          status: 403, headers: JSON_HEADERS,
+        });
+      }
+      const code = url.searchParams.get('code') === 'wti' ? 'wti' : 'brent';
+      const spec = historySpec(code);
+      const hist = await env.OIL_KV.get(spec.kvKey, 'json').catch(() => null);
+      const rows = Array.isArray(hist && hist.rows) ? hist.rows : [];
+      const tail = rows.slice(-14).map((r, i, arr) => {
+        const prev = i > 0 ? arr[i - 1] : null;
+        return {
+          day: r.day, open: r.open, high: r.high, low: r.low, close: r.close,
+          src: r.src || null, settled: !!r.settled, samples: r.samples ?? null,
+          sameCloseAsPrev: prev ? prev.close === r.close : false,
+        };
+      });
+      return new Response(JSON.stringify({
+        code, mode: hist && hist.mode, total: rows.length,
+        updatedLocal: hist && hist.updatedLocal,
+        note: 'src=self 且 sameCloseAsPrev 连续 true = 分钟采样冻结价被写进日线；' +
+              'src=import / Yahoo 属官方日线，同价是市场真实情况',
+        rows: tail,
+      }, null, 2), { headers: JSON_HEADERS });
     }
 
     // ---------------- /session 自建开收盘判定（B18）----------------
@@ -995,13 +1072,32 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
         });
       }
       const sc = url.searchParams.get('code');
-      const codes = sc === 'wti' ? ['wti'] : (sc === 'brent' ? ['brent'] : ['brent', 'wti']);
+      const day = url.searchParams.get('day');
+      // ★ B23：支持 gold，品种列表统一取自 CODES
+      const codes = (sc && CODES.indexOf(sc) !== -1) ? [sc] : CODES;
+
+      // ★ B23：带 ?day= 就回溯那天的判定依据 —— 不只想看结论，还想知道凭什么
+      if (day) {
+        const trace = {};
+        for (const c of codes) trace[c] = await traceDay(env, c, day, new Date());
+        return new Response(JSON.stringify({
+          ok: true,
+          hasD1: !!(env && env.DB),
+          day,
+          note: 'timeline.lastTradeAt = 市场实际停止成交的时刻；' +
+                'logged.close = 落库认定的休市时刻；logged.detected = 我们翻牌的时刻（天生滞后）',
+          data: trace,
+        }, null, 2), { headers: JSON_HEADERS });
+      }
+
       const snap = {};
       for (const c of codes) snap[c] = await sessionSnapshot(env, c, new Date());
       return new Response(JSON.stringify({
         ok: true,
         hasD1: !!(env && env.DB),
-        note: 'state 由「价格冻结时长」判定，不依赖时区推算；open_ts/close_ts 是实测出来的开收时刻',
+        note: 'state 由「价格冻结时长」判定，不依赖时区推算；' +
+              'close_ts 是市场实际休市时刻，detected_ts 是我们认定它的时刻（滞后约 2 小时）',
+        tip: '带 ?day=2026-10-30 可回溯那天的判定依据；带 &code=gold 只看黄金',
         data: snap,
       }, null, 2), { headers: JSON_HEADERS });
     }
@@ -1028,7 +1124,8 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
         });
       }
       const out = {};
-      for (const c of ['brent', 'wti']) out[c] = await pruneMinutes(env, c, 7);
+      // ★ B23：黄金也一起清（原来只清原油两支）
+      for (const c of CODES) out[c] = await pruneMinutes(env, c, KEEP_TICK_DAYS);
       return new Response(JSON.stringify({ ok: true, deleted: out }, null, 2), { headers: JSON_HEADERS });
     }
 
@@ -1288,6 +1385,11 @@ ${histDetail}
       console.log(`[cron] 黄金抓取 — 北京 ${h}:${String(min).padStart(2, '0')}，每 3 分钟一次`);
       if (!jobs.length) return;
       await Promise.allSettled(jobs);
+      /* ★ B23：黄金也进 D1。放在抓取之后读 KV，拿到的是刚写入的新值，
+         不会像并行那样可能读到上一拍的旧价。
+         原来黄金只有时区推算（weekend/settlement），源挂了照样显示 open，
+         现在跟原油一样有实测底账。 */
+      await recordGoldMinute(env).catch(() => null);
       return;                                    // ★ 只跑黄金 + 原油采样，不跑原油主抓取
     }
 
@@ -1780,6 +1882,28 @@ async function recordOilMinutes(env) {
     return out;
   } catch (e) {
     return null;                     // 采样失败绝不能影响同批次的黄金抓取
+  }
+}
+
+/**
+ * ★ B23：把黄金价格记一笔进 D1，给它也配上实测开收盘判定。
+ *
+ * 为什么不顺手在 fetchGoldAndSave 里写：
+ *   那边是三源重试的复杂逻辑，塞进去会让它更难读，而且失败路径多。
+ *   这里只读刚写好的 KV，零额外网络请求，失败也完全不影响主流程。
+ *
+ * 额度：3 分钟 1 笔 = 480 行/天，加上原油两支共 1,440 行，
+ *       占 D1 免费版 10 万 rows/天的 1.4%。
+ */
+async function recordGoldMinute(env) {
+  if (!env || !env.DB) return null;
+  try {
+    const g = await env.OIL_KV.get('gold_data', 'json').catch(() => null);
+    const p = g && Number(g.priceUsdPerOz);
+    if (!isFinite(p) || p <= 0) return null;
+    return await recordSample(env, 'gold', p, g.fetchedFrom || null, new Date());
+  } catch (e) {
+    return null;                     // 采样失败绝不能影响黄金抓取主流程
   }
 }
 

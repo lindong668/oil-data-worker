@@ -1,4 +1,9 @@
 // ============================================================
+// 3 号 · 原油秒级专页  —  B24（补齐多源 + 诊断接口）
+// ------------------------------------------------------------
+// ★ B24：补交未交付的 B23 内容，并把秒级取价从 4 条同源 hf
+//   扩到 9 条 / 6 家；3 秒节拍、cron、日线写入逻辑一字未动。
+// ============================================================
 // 3 号 · 原油秒级专页  —  B14（重写图表）
 // ------------------------------------------------------------
 // 路由（受 ACCESS_KEY 保护）：
@@ -116,6 +121,110 @@ async function srcTencentHf() {
 async function srcTencentSqt() {
   const txt = await getText('https://sqt.gtimg.cn/q=hf_OIL,hf_CL', 3000);
   return pack(parseHfMap(txt), 'txsqt');
+}
+
+/* ============================================================
+ * ★ B24：秒级页补齐多源
+ * ------------------------------------------------------------
+ * 原 4 条 hf 其实只覆盖新浪 / 腾讯 2 家（各 2 个 URL 变体）。
+ * 这一条链路一冻结：/api/oil-tick 每 3 秒问到的都是沿用值；
+ * 而同一个 fetchTick() 还挂在「每 3 分钟」那条 cron 写 tick_min，日线兜底
+ * 会把冻结价连续聚合进两天 —— 实时不动 + 日线同价是同一个故障。
+ *
+ * 补 5 条独立链路，合计 9 条 URL / 6 家。
+ * 不拖慢 3 秒：只在 hf 全灭或价龄异常时由 index.js 调用，
+ * 且结果缓存 30 秒复用，不增加每拍外网请求。
+ * ============================================================ */
+function chkFb(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= HF_RANGE[0] && n <= HF_RANGE[1] ? n : 0;
+}
+async function srcBiquoteFb() {
+  const [w, b] = await Promise.all([
+    getText('https://biquote.io/api/XTIUSD', 2200).then(JSON.parse).catch(() => null),
+    getText('https://biquote.io/api/XBRUSD', 2200).then(JSON.parse).catch(() => null),
+  ]);
+  const mid = (j) => {
+    const bid = Number(j && j.bid), ask = Number(j && j.ask);
+    if (bid && ask) return chkFb((bid + ask) / 2);
+    return chkFb(j && j.mid);
+  };
+  return { brent: mid(b), wti: mid(w), note: 'biquote 券商 MT5 链路' };
+}
+async function srcYahooChartFb(host) {
+  const one = async (sym) => {
+    const j = JSON.parse(await getText(
+      `https://${host}.finance.yahoo.com/v8/finance/chart/${sym}?interval=1m&range=1d`, 2200));
+    const r = j && j.chart && j.chart.result && j.chart.result[0];
+    const q = r && r.indicators && r.indicators.quote && r.indicators.quote[0];
+    const c = q && q.close;
+    let p = 0;
+    if (c) for (let i = c.length - 1; i >= 0; i--) { p = chkFb(c[i]); if (p) break; }
+    if (!p) p = chkFb(r && r.meta && r.meta.regularMarketPrice);
+    return p;
+  };
+  const [wti, brent] = await Promise.all([one('CL=F').catch(() => 0), one('BZ=F').catch(() => 0)]);
+  return { brent, wti, note: 'Yahoo chart ' + host };
+}
+async function srcSparkFb() {
+  const one = async (sym) => {
+    const j = JSON.parse(await getText(
+      `https://query1.finance.yahoo.com/v7/finance/spark?symbols=${sym}&range=1d&interval=1m`, 2200));
+    const r = j && j.spark && j.spark.result && j.spark.result[0];
+    const m = r && r.response && r.response[0] && r.response[0].meta;
+    return chkFb(m && (m.regularMarketPrice || m.previousClose));
+  };
+  const [wti, brent] = await Promise.all([one('CL%3DF').catch(() => 0), one('BZ%3DF').catch(() => 0)]);
+  return { brent, wti, note: 'Yahoo spark' };
+}
+async function srcStooqFb() {
+  const one = async (s) => {
+    const txt = await getText(`https://stooq.com/q/l/?s=${s}&f=sd2t2ohlcv&h&e=csv`, 2200);
+    const lines = txt.trim().split('\n');
+    if (lines.length < 2) return 0;
+    const cols = lines[0].split(','), vals = lines[1].split(',');
+    const i = cols.indexOf('Close');
+    return chkFb(i >= 0 ? vals[i] : vals[vals.length - 2]);
+  };
+  const [brent, wti] = await Promise.all([one('cb.f').catch(() => 0), one('cl.f').catch(() => 0)]);
+  return { brent, wti, note: 'Stooq CSV' };
+}
+
+/** 全部取价链路（供诊断接口直接吐给人工核对） */
+export const TICK_SOURCES = [
+  'sinahf', 'sinahfhttp', 'txhf', 'txsqt',
+  'biquote', 'yahoo', 'yahoo2', 'spark', 'stooq',
+];
+
+/** 5 条独立链路并发，按序合流；绝不影响原 4 条 hf 的 3 秒主路 */
+export async function fetchTickFallback() {
+  const jobs = [
+    ['biquote', srcBiquoteFb()],
+    ['yahoo', srcYahooChartFb('query1')],
+    ['yahoo2', srcYahooChartFb('query2')],
+    ['spark', srcSparkFb()],
+    ['stooq', srcStooqFb()],
+  ];
+  const settled = await Promise.all(
+    jobs.map(j => j[1].then(
+      r => ({ ok: true, r, name: j[0] }),
+      e => ({ ok: false, e: String(e && e.message || e), name: j[0] })
+    ))
+  );
+  let brent = 0, wti = 0, provider = '';
+  const sources = [];
+  for (const s of settled) {
+    // 请求成功但两个品种都没价 = 这一家实际没提供数据，诊断里必须标失败
+    const usable = s.ok && !!(s.r.brent || s.r.wti);
+    sources.push({ name: s.name, ok: usable, brent: s.ok ? s.r.brent : 0,
+                   wti: s.ok ? s.r.wti : 0,
+                   err: !s.ok ? s.e : (usable ? null : '两个品种都没返回价') });
+    if (!usable) continue;
+    if (!brent && s.r.brent) { brent = s.r.brent; provider = s.name; }
+    if (!wti && s.r.wti) { wti = s.r.wti; if (!provider) provider = s.name; }
+  }
+  return { ok: !!(brent || wti), brent, wti, provider,
+           asOf: new Date().toISOString(), ageSec: 0, sources };
 }
 
 /**
