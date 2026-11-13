@@ -40,6 +40,10 @@ const HF_RANGE = [10, 400];
 /* 价龄超过这个秒数视为休市：20 分钟无新成交 */
 const CLOSED_AGE_SEC = 1200;
 
+/* ★ B25：价龄超过 2 分钟但还没到休市 = 「这条符号停更」，
+ *   是启用独立源兜底的门槛。与 index.js 的 HF_STUCK_SEC 同一口径。 */
+const STUCK_AGE_SEC = 120;
+
 // ------------------------------------------------------------
 // 抓取工具
 // ------------------------------------------------------------
@@ -95,7 +99,12 @@ function pack(map, note) {
   return {
     brent: b ? b.v : 0,
     wti: w ? w.v : 0,
+    /* ★ B25：整拍时间戳保留兼容（取两者较新），另存【逐品种】自己的行情时间。
+     *   hf_OIL 停更、hf_CL 还在成交时，Math.max 会把 WTI 的新时间盖到布伦特
+     *   头上 —— 既判不出 Closed，也永远够不到 fallback 门槛，数字就冻死。 */
     asOfMs: Math.max(b ? b.ts : 0, w ? w.ts : 0),
+    brentAsOfMs: b ? b.ts : 0,
+    wtiAsOfMs:   w ? w.ts : 0,
     note: note,
   };
 }
@@ -245,19 +254,33 @@ export async function fetchTick() {
   );
 
   let brent = 0, wti = 0, asOfMs = 0, provider = '';
+  let brentAsOfMs = 0, wtiAsOfMs = 0;
   const failed = [];
   for (const s of settled) {
     if (!s.ok) { failed.push(s.name); continue; }
-    if (!brent && s.r.brent) brent = s.r.brent;
-    if (!wti && s.r.wti) wti = s.r.wti;
+    /* ★ B25：品种第一次取到值时，同时锁下【这条符号自己】的行情时间；
+     *   后面同源变体再回的旧时间不再覆盖，避免把布伦特洗成新的。 */
+    if (!brent && s.r.brent) {
+      brent = s.r.brent;
+      brentAsOfMs = s.r.brentAsOfMs || s.r.asOfMs || 0;
+    }
+    if (!wti && s.r.wti) {
+      wti = s.r.wti;
+      wtiAsOfMs = s.r.wtiAsOfMs || s.r.asOfMs || 0;
+    }
     if (!asOfMs && s.r.asOfMs) { asOfMs = s.r.asOfMs; provider = s.name; }
   }
   if (!brent && !wti) {
     return { ok: false, error: '四条源全失败', failed: failed };
   }
-  if (!asOfMs) asOfMs = Date.now();
+  const now = Date.now();
+  if (!asOfMs) asOfMs = now;
 
-  const ageSec = Math.max(0, Math.round((Date.now() - asOfMs) / 1000));
+  const ageSec = Math.max(0, Math.round((now - asOfMs) / 1000));
+  const ageBrentSec = brentAsOfMs ? Math.max(0, Math.round((now - brentAsOfMs) / 1000)) : ageSec;
+  const ageWtiSec   = wtiAsOfMs   ? Math.max(0, Math.round((now - wtiAsOfMs)   / 1000)) : ageSec;
+  const marketBrent = ageBrentSec > CLOSED_AGE_SEC ? 'closed' : 'open';
+  const marketWti   = ageWtiSec   > CLOSED_AGE_SEC ? 'closed' : 'open';
   return {
     ok: true,
     brent: brent,
@@ -265,11 +288,68 @@ export async function fetchTick() {
     asOf: new Date(asOfMs).toISOString(),
     ageSec: ageSec,
     provider: provider,
-    /* 休市判定：价龄过大 = 无人成交，比看日历准 */
-    market: ageSec > CLOSED_AGE_SEC ? 'closed' : 'open',
+    /* 整拍 market 保留兼容，但改成「两个品种都真没人成交」才算休市 */
+    market: (marketBrent === 'closed' && marketWti === 'closed') ? 'closed' : 'open',
+    /* ★ B25 逐品种：两条符号各算各的，互不掩盖 */
+    ageBrentSec: ageBrentSec,
+    ageWtiSec: ageWtiSec,
+    marketBrent: marketBrent,
+    marketWti: marketWti,
+    asOfBrent: new Date(brentAsOfMs || asOfMs).toISOString(),
+    asOfWti:   new Date(wtiAsOfMs   || asOfMs).toISOString(),
+    brentStuck: ageBrentSec > STUCK_AGE_SEC && ageBrentSec <= CLOSED_AGE_SEC,
+    wtiStuck:   ageWtiSec   > STUCK_AGE_SEC && ageWtiSec   <= CLOSED_AGE_SEC,
     failed: failed,
-    ts: Date.now(),
+    ts: now,
   };
+}
+
+/* ★ B25：把「独立源结果怎么并进秒级响应」抽成纯函数，便于真代码直接测。
+ * ------------------------------------------------------------------
+ * B24 的 bug：只在 out.brent 为 0 时才补，而 hf 冻结时 brent 是 95.98
+ *   （非 0、ok:true），于是 fallback 里那个 95.56 永远进不了生产，
+ *   只在 /tick-debug 里看得见。
+ * 现在：某品种自己停更、且独立源给出不同的价 → 直接覆盖，并把该品种
+ *   的价龄/状态一并复位，前端不再把冻死的值当 Live 显示。 */
+export function mergeTickFallback(t, fb, opt) {
+  const o = opt || {};
+  const out = (t && t.ok) ? Object.assign({}, t) : { ok: false };
+  if (!fb || !fb.ok) return out;
+  const stuckB = !!(o.brentStuck || (t && t.brentStuck));
+  const stuckW = !!(o.wtiStuck   || (t && t.wtiStuck));
+
+  if (!out.brent && fb.brent) {
+    out.brent = fb.brent;
+    out.brentFrom = fb.provider;
+    out.brentRecovered = true;
+  } else if (stuckB && fb.brent && Math.abs(fb.brent - out.brent) > 0.005) {
+    out.brentFrozenVal = out.brent;
+    out.brent = fb.brent;
+    out.brentFrom = fb.provider;
+    out.brentRecovered = true;
+    out.ageBrentSec = 0;
+    out.marketBrent = 'open';
+    out.brentStuck = false;
+  }
+  if (!out.wti && fb.wti) {
+    out.wti = fb.wti;
+    out.wtiFrom = fb.provider;
+    out.wtiRecovered = true;
+  } else if (stuckW && fb.wti && Math.abs(fb.wti - out.wti) > 0.005) {
+    out.wtiFrozenVal = out.wti;
+    out.wti = fb.wti;
+    out.wtiFrom = fb.provider;
+    out.wtiRecovered = true;
+    out.ageWtiSec = 0;
+    out.marketWti = 'open';
+    out.wtiStuck = false;
+  }
+  if (out.brent || out.wti) out.ok = true;
+  out.fallback = fb.provider;
+  out.fallbackUsed = !!(out.brentRecovered || out.wtiRecovered);
+  if (!out.asOf) out.asOf = fb.asOf;
+  if (out.marketBrent === 'open' || out.marketWti === 'open') out.market = 'open';
+  return out;
 }
 
 // ------------------------------------------------------------
@@ -456,6 +536,12 @@ export async function renderOilReportPage(env, code, keyQS) {
   const initWti = tick && tick.ok ? tick.wti : (wtiRows.length ? wtiRows[wtiRows.length - 1].close : 0);
   const initAge = tick && tick.ok ? tick.ageSec : null;
   const initMarket = tick && tick.ok ? tick.market : 'unknown';
+  /* ★ B25：两张卡各用各的价龄 / 状态，不再共用一个 initMarket。
+   *   旧版布伦特冻结 20 分钟、WTI 还在成交时，首屏两张都写 Live。 */
+  const initAgeB = tick && tick.ok ? (tick.ageBrentSec != null ? tick.ageBrentSec : initAge) : null;
+  const initAgeW = tick && tick.ok ? (tick.ageWtiSec   != null ? tick.ageWtiSec   : initAge) : null;
+  const initMktB = tick && tick.ok ? (tick.marketBrent || initMarket) : 'unknown';
+  const initMktW = tick && tick.ok ? (tick.marketWti   || initMarket) : 'unknown';
 
   const keyParam = keyQS ? keyQS.replace(/^\?/, '&') : '';
 
@@ -552,8 +638,8 @@ export async function renderOilReportPage(env, code, keyQS) {
 
   /* ---- 两张实时卡 ---- */
   h.push('<div class="cards">');
-  h.push(cardHtml('brent', 'Brent Crude', initBrent, brentRows, initMarket, initAge));
-  h.push(cardHtml('wti', 'WTI Crude', initWti, wtiRows, initMarket, initAge));
+  h.push(cardHtml('brent', 'Brent Crude', initBrent, brentRows, initMktB, initAgeB));
+  h.push(cardHtml('wti', 'WTI Crude', initWti, wtiRows, initMktW, initAgeW));
   h.push('</div>');
 
   /* ---- 走势图 ---- */
@@ -845,10 +931,13 @@ function inlineScript() {
     '    if(!j||!j.ok)return;',
     '    if(j.brent)LIVE.brent=j.brent;',
     '    if(j.wti)LIVE.wti=j.wti;',
-    '    var age=j.ageSec;',
-    '    var ageTxt=" · "+(age<60?age+"s ago":Math.round(age/60)+"m ago");',
-    '    var closed=j.market==="closed";',
+    /* ★ B25：逐品种价龄 / 状态，缺字段时回落整拍值，老版本后端也能跑 */
     '    ["brent","wti"].forEach(function(c){',
+    '      var isB=c==="brent";',
+    '      var ag=isB?(j.ageBrentSec!=null?j.ageBrentSec:j.ageSec):(j.ageWtiSec!=null?j.ageWtiSec:j.ageSec);',
+    '      var mk=isB?(j.marketBrent||j.market):(j.marketWti||j.market);',
+    '      var closed=mk==="closed";',
+    '      var ageTxt=" · "+(ag==null?"—":(ag<60?ag+"s ago":Math.round(ag/60)+"m ago"));',
     '      var a=document.getElementById("age-"+c);if(a)a.textContent=ageTxt;',
     '      var m=document.getElementById("mkt-"+c);if(m)m.textContent=closed?"Closed":"Live";',
     '      var dot=document.getElementById("dot-"+c);',

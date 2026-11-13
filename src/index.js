@@ -1,5 +1,5 @@
 import { SEED_BRENT, SEED_WTI } from './seed.js';
-import { fetchTick, fetchTickFallback, TICK_SOURCES, renderOilReportPage } from './oilReport.js';   /* ★ B13 原油秒级专页 / ★ B24 补齐多源 */
+import { fetchTick, fetchTickFallback, mergeTickFallback, TICK_SOURCES, renderOilReportPage } from './oilReport.js';   /* ★ B13 原油秒级专页 / ★ B24 补齐多源 / ★ B25 逐品种 */
 import { recordSample, sessionSnapshot, aggregateFromMinutes, pruneMinutes, runRetention, dbStats, KEEP_TICK_DAYS, traceDay, CODES } from './session.js'; /* ★ B18 自建开收盘判定 / ★ B23 黄金纳入 + 判定依据回溯 */
 
 /* ★ B24：独立链路兜底结果缓存。
@@ -992,22 +992,27 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
         });
       }
       const t = await fetchTick().catch(() => ({ ok: false }));
-      const age = t && t.ageSec != null ? t.ageSec : null;
-      const needFb = !t || !t.ok ||
+      const ageB = t && t.ageBrentSec != null ? t.ageBrentSec : null;
+      const ageW = t && t.ageWtiSec   != null ? t.ageWtiSec   : null;
+      const age  = t && t.ageSec      != null ? t.ageSec      : null;
+      /* ★ B25：冻结按【该品种自己的行情时间】判，不再被整拍 ageSec
+       *   （= Math.max(布伦特, WTI)，WTI 一动就 ≈18s）掩盖。
+       *   B24 就是卡在这里：ageSec=18 永远落在 120~1200 之外，
+       *   fallback 只在 /tick-debug 里跑，生产一拍都不触发。 */
+      const brentStuck = !!(t && t.ok && (t.brentStuck ||
+        (ageB != null && ageB > HF_STUCK_SEC && ageB < HF_CLOSED_SEC)));
+      const wtiStuck = !!(t && t.ok && (t.wtiStuck ||
+        (ageW != null && ageW > HF_STUCK_SEC && ageW < HF_CLOSED_SEC)));
+      const needFb = !t || !t.ok || brentStuck || wtiStuck ||
         (age != null && age > HF_STUCK_SEC && age < HF_CLOSED_SEC);
       const nowMs = Date.now();
       if (needFb && nowMs - __fbAt > FB_MIN_GAP_MS) {
         __fbAt = nowMs;
         __fbCache = await fetchTickFallback().catch(() => null);
       }
-      const out = (t && t.ok) ? Object.assign({}, t) : { ok: false };
-      if (__fbCache && __fbCache.ok) {
-        if (!out.brent) out.brent = __fbCache.brent;
-        if (!out.wti) out.wti = __fbCache.wti;
-        out.ok = true;
-        out.fallback = __fbCache.provider;
-        if (!out.asOf) out.asOf = __fbCache.asOf;
-      }
+      /* ★ B25：独立源有不同价时【覆盖】冻结值，不是只补 0。
+       *   旧逻辑 if(!out.brent) 永远进不去（冻结值是 95.98，不是 0）。 */
+      const out = mergeTickFallback(t, __fbCache, { brentStuck, wtiStuck });
       out.sources = TICK_SOURCES;
       return new Response(JSON.stringify(out), { headers: JSON_HEADERS });
     }
@@ -1027,8 +1032,9 @@ ${cn.list.map(r => `<option value="${r.province}" ${r.province === '福建' ? 's
         intervalMs: 3000,
         sources: TICK_SOURCES,
         hf, fallback: fb,
-        hint: 'hf.ageSec 落在 120~1200 且价格不动 = 新浪/腾讯链路冻结；' +
-              'fallback 有价 = 独立链路可用；两边都冻结才是真休市',
+        hint: 'B25：看 hf.ageBrentSec / ageWtiSec（各自行情时间），别看整拍 ageSec；' +
+              'brentStuck=true 且 fallback.brent≠hf.brent = 新浪 hf_OIL 停更、独立源有价，' +
+              '生产会用独立源覆盖；两个品种价龄都>1200 才是真休市',
       }, null, 2), { headers: JSON_HEADERS });
     }
 
