@@ -353,6 +353,62 @@ export function mergeTickFallback(t, fb, opt) {
 }
 
 // ------------------------------------------------------------
+// ★ B26：开市当天的「今日」行
+// ------------------------------------------------------------
+// 后端 B16 起把盘中自建日线关掉（if (false && ...)），只剩「收盘后
+// Yahoo 官方日线定格」一条写入路径；而交易日的收盘落在北京次日早上，
+// 所以开市当天报表里没有当天行，前端又把实时价覆盖到「最后一行」
+// （其实是昨天），日期与 today 标签就都错了。
+//
+// 这里按各市场自己的交易日历算出「今天属于哪个交易日」，开市中且
+// 历史里还没有该行时补一条。收盘定格写入真值后自动接上，不冲突。
+// ------------------------------------------------------------
+const WEEKDAY_MAP = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+/** 该时刻对应的交易日（布伦特看伦敦 / WTI 看芝加哥）；周末返回空串 */
+function marketTradingDay(code, now) {
+  const isWti = code === 'wti';
+  const tz = isWti ? 'America/Chicago' : 'Europe/London';
+  let y, m, d, wd, hour;
+  try {
+    const f = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+      weekday: 'short', hour: '2-digit', hourCycle: 'h23',
+    });
+    const p = {};
+    f.formatToParts(now).forEach(function (x) { p[x.type] = x.value; });
+    y = p.year; m = p.month; d = p.day;
+    wd = WEEKDAY_MAP[p.weekday]; hour = +p.hour;
+  } catch (e) { return ''; }
+  if (wd == null || !y || !m || !d) return '';
+  let day = y + '-' + m + '-' + d;
+  const shift = function (n) {
+    const dt = new Date(day + 'T12:00:00Z');
+    dt.setUTCDate(dt.getUTCDate() + n);
+    return dt.toISOString().slice(0, 10);
+  };
+  if (isWti) {
+    if (hour >= 17) day = shift(1);                       // 芝加哥 17:00 后归次日
+  } else {
+    if (wd === 0 && hour >= 23) day = shift(1);           // 周日 23:00 开盘归周一
+    else if (wd >= 2 && wd <= 6 && hour < 1) day = shift(-1); // 凌晨休市归前一交易日
+  }
+  const w = new Date(day + 'T12:00:00Z').getUTCDay();
+  return (w >= 1 && w <= 5) ? day : '';                  // 周六周日不建行
+}
+
+/** 历史里没有该交易日时，用当前实时价补一条盘中行 */
+function withTodayRow(rows, day, price) {
+  if (!day || !(price > 0) || !rows.length) return rows;
+  const out = rows.slice();
+  const last = out[out.length - 1];
+  if (!last || !last.day || last.day === day || last.day > day) return out;
+  out.push({ day: day, open: price, high: price, low: price,
+             close: price, volume: 0, src: 'live' });
+  return out;
+}
+
+// ------------------------------------------------------------
 // 历史行：KV 优先，KV 为空时回落到内置种子（让页面部署后立刻有内容）
 // ------------------------------------------------------------
 function seedToRows(seed) {
@@ -515,9 +571,33 @@ export async function renderOilReportPage(env, code, keyQS) {
     loadRows(env, 'wti_history', SEED_WTI),
   ]);
 
-  const brentRows = bRes.rows;
-  const wtiRows = wRes.rows;
+  const baseBrent = bRes.rows;
+  const baseWti = wRes.rows;
   const fromSeed = bRes.fromSeed || wRes.fromSeed;
+
+  /* 服务端先抓一次，首屏就有实时价（不用等第一次 3 秒轮询） */
+  let tick = null;
+  try { tick = await fetchTick(); } catch (_) {}
+
+  const initBrent = tick && tick.ok ? tick.brent : (baseBrent.length ? baseBrent[baseBrent.length - 1].close : 0);
+  const initWti = tick && tick.ok ? tick.wti : (baseWti.length ? baseWti[baseWti.length - 1].close : 0);
+  const initAge = tick && tick.ok ? tick.ageSec : null;
+  const initMarket = tick && tick.ok ? tick.market : 'unknown';
+  /* ★ B25：两张卡各用各的价龄 / 状态，不再共用一个 initMarket。
+   *   旧版布伦特冻结 20 分钟、WTI 还在成交时，首屏两张都写 Live。 */
+  const initAgeB = tick && tick.ok ? (tick.ageBrentSec != null ? tick.ageBrentSec : initAge) : null;
+  const initAgeW = tick && tick.ok ? (tick.ageWtiSec   != null ? tick.ageWtiSec   : initAge) : null;
+  const initMktB = tick && tick.ok ? (tick.marketBrent || initMarket) : 'unknown';
+  const initMktW = tick && tick.ok ? (tick.marketWti   || initMarket) : 'unknown';
+
+  /* ★ B26：开市就补今日行。只在「该品种确实在成交」时补，休市/周末不补。 */
+  const now = new Date();
+  const dayB = marketTradingDay('brent', now);
+  const dayW = marketTradingDay('wti', now);
+  const openB = (tick && tick.ok && (tick.marketBrent || tick.market) === 'open') ? tick.brent : 0;
+  const openW = (tick && tick.ok && (tick.marketWti   || tick.market) === 'open') ? tick.wti   : 0;
+  const brentRows = withTodayRow(baseBrent, dayB, openB);
+  const wtiRows = withTodayRow(baseWti, dayW, openW);
 
   /* 内联给前端的紧凑数据：只取曲线和表格需要的字段 */
   const packRows = function (rows) {
@@ -527,21 +607,6 @@ export async function renderOilReportPage(env, code, keyQS) {
   };
   const dataBrent = JSON.stringify(packRows(brentRows));
   const dataWti = JSON.stringify(packRows(wtiRows));
-
-  /* 服务端先抓一次，首屏就有实时价（不用等第一次 3 秒轮询） */
-  let tick = null;
-  try { tick = await fetchTick(); } catch (_) {}
-
-  const initBrent = tick && tick.ok ? tick.brent : (brentRows.length ? brentRows[brentRows.length - 1].close : 0);
-  const initWti = tick && tick.ok ? tick.wti : (wtiRows.length ? wtiRows[wtiRows.length - 1].close : 0);
-  const initAge = tick && tick.ok ? tick.ageSec : null;
-  const initMarket = tick && tick.ok ? tick.market : 'unknown';
-  /* ★ B25：两张卡各用各的价龄 / 状态，不再共用一个 initMarket。
-   *   旧版布伦特冻结 20 分钟、WTI 还在成交时，首屏两张都写 Live。 */
-  const initAgeB = tick && tick.ok ? (tick.ageBrentSec != null ? tick.ageBrentSec : initAge) : null;
-  const initAgeW = tick && tick.ok ? (tick.ageWtiSec   != null ? tick.ageWtiSec   : initAge) : null;
-  const initMktB = tick && tick.ok ? (tick.marketBrent || initMarket) : 'unknown';
-  const initMktW = tick && tick.ok ? (tick.marketWti   || initMarket) : 'unknown';
 
   const keyParam = keyQS ? keyQS.replace(/^\?/, '&') : '';
 
@@ -666,7 +731,9 @@ export async function renderOilReportPage(env, code, keyQS) {
     + '</tr></thead><tbody></tbody></table></div>');
   h.push('<button class="more" id="more">Show all ▼</button>');
   h.push('<div class="note">Daily bars exported from Investing.com, settled after close by Yahoo official daily data. '
-    + 'Change is close-to-close. The last row is <b>today</b>; while the session is open its high / low / close track the live price.</div>');
+    + 'Change is close-to-close. On an open session the current trading day gets its own <b>today</b> row: '
+    + 'open is the first observed price and high / low / close track the live ticks. '
+    + 'It is replaced by the official settled bar after close.</div>');
   h.push('</div>');
 
   h.push('<p style="font-size:12px"><a href="/' + keyQS + '">← Home</a> · '
@@ -679,6 +746,7 @@ export async function renderOilReportPage(env, code, keyQS) {
   h.push('var CODE=' + JSON.stringify(isWti ? 'wti' : 'brent') + ';');
   h.push('var KEY=' + JSON.stringify(keyQS ? keyQS.replace(/^\?/, '') : '') + ';');
   h.push('var LIVE={brent:' + (initBrent || 0) + ',wti:' + (initWti || 0) + '};');
+  h.push('var TODAY=' + JSON.stringify({ brent: dayB, wti: dayW }) + ';');
   h.push('var H=' + CHART_H + ';');
   h.push('var V={i0f:0,span:130,atEnd:true,hover:-1,hoverY:-1};');
   h.push('var ALL=false,SEL_Y="all",SEL_M="all",TLIM=30;');
@@ -751,7 +819,10 @@ function inlineScript() {
     '  var r=DATA[c]||[];if(!r.length)return [];',
     '  var p=LIVE[c];if(!p)return r;',
     '  var out=r.slice();var last=out[out.length-1].slice();',
-    '  last[2]=Math.max(last[2],p);last[3]=Math.min(last[3],p);last[4]=p;',
+    '  if(last[0]===TODAY[c]){',
+    '    last[2]=Math.max(last[2],p);last[3]=Math.min(last[3],p);last[4]=p;',
+    '    r[r.length-1][2]=last[2];r[r.length-1][3]=last[3];r[r.length-1][4]=last[4];',
+    '  }else{last[4]=p}',
     '  out[out.length-1]=last;return out;',
     '}',
     'function clampView(total){',
@@ -874,11 +945,12 @@ function inlineScript() {
     '    ii=idxs[i];r=all[ii];',
     '    prev=ii>0?all[ii-1][4]:null;',
     '    close=r[4];hi=r[2];lo=r[3];',
-    '    if(ii===total-1&&LIVE[CODE]){close=LIVE[CODE];hi=Math.max(hi,close);lo=Math.min(lo,close)}',
+    '    if(r[0]===TODAY[CODE]&&LIVE[CODE]){close=LIVE[CODE];hi=Math.max(hi,close);lo=Math.min(lo,close);',
+    '      r[2]=hi;r[3]=lo;r[4]=close}',
     '    d=(prev&&close)?+(((close-prev)/prev)*100).toFixed(2):null;',
     '    cls=d==null?"":(d>=0?"up":"down");',
     '    sign=d==null?"—":((d>=0?"+":"")+d.toFixed(2)+"%");',
-    '    h+="<tr><td>"+r[0]+(ii===total-1?" <span style=\\"color:#f59e0b;font-size:11px\\">today</span>":"")+"</td>"',
+    '    h+="<tr><td>"+r[0]+(r[0]===TODAY[CODE]?" <span style=\\"color:#f59e0b;font-size:11px\\">today</span>":"")+"</td>"',
     '      +"<td>"+r[1].toFixed(2)+"</td><td>"+hi.toFixed(2)+"</td><td>"+lo.toFixed(2)+"</td>"',
     '      +"<td><b>"+close.toFixed(2)+"</b></td><td class=\\""+cls+"\\">"+sign+"</td></tr>";',
     '  }',
