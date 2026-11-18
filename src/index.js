@@ -1338,6 +1338,50 @@ ${histDetail}
       return new Response(txt, { headers: TEXT_HEADERS });
     }
 
+    // ---------------- /alert-switch（B29：两个通知开关，存 KV，不进环境变量、不触发部署） ----------------
+    if (url.pathname === '/alert-switch') {
+      if (!ok) return ghost();
+      const type = String(url.searchParams.get('type') || '').toLowerCase();
+      const onRaw = url.searchParams.get('on');
+      const sw = await readSwitches(env);
+      let note = '只读：未带 on 参数，返回当前开关状态';
+
+      if (onRaw !== null && (type === 'fujian' || type === 'gold')) {
+        const on = onRaw === '1' || onRaw === 'true' || onRaw === 'on';
+        const before = sw[type];
+        sw[type] = on;
+        await writeSwitches(env, sw, beijingNow());
+        if (type === 'gold' && on && !before) {
+          // 刚打开 → 清掉冷却与日计数，保证下一拍（≤3 分钟）必发第一封用于验收
+          await env.OIL_KV.delete(GOLD_ALERT_STATE_KEY).catch(() => {});
+          note = '黄金开关已打开：冷却已重置，下一拍（3 分钟内）价格有变动即发一封';
+        } else {
+          note = `${type === 'gold' ? '黄金' : '福建油价'}开关已${on ? '打开' : '关闭'}`;
+        }
+      } else if (onRaw !== null) {
+        note = 'type 只接受 fujian 或 gold';
+      }
+
+      const gst = await env.OIL_KV.get(GOLD_ALERT_STATE_KEY, 'json').catch(() => null);
+      return new Response(JSON.stringify({
+        ok: true,
+        switches: sw,
+        defaults: ALERT_SWITCH_DEFAULT,
+        note,
+        goldAlert: gst ? {
+          day: gst.day || null, dayCount: gst.dayCount || 0,
+          lastMailedAt: gst.lastMailedAt || null, lastStatus: gst.lastStatus || null,
+        } : null,
+        usage: {
+          '打开黄金': '/alert-switch?type=gold&on=1&key=<ACCESS_KEY>',
+          '关闭黄金': '/alert-switch?type=gold&on=0&key=<ACCESS_KEY>',
+          '打开福建油价': '/alert-switch?type=fujian&on=1&key=<ACCESS_KEY>',
+          '关闭福建油价': '/alert-switch?type=fujian&on=0&key=<ACCESS_KEY>',
+        },
+        at: beijingNow(),
+      }, null, 2), { headers: JSON_HEADERS });
+    }
+
     // ---------------- /oil-alert-test（B28：邮件通道自检，发一封测试邮件） ----------------
     if (url.pathname === '/oil-alert-test') {
       if (!ok) return ghost();
@@ -1374,8 +1418,16 @@ ${histDetail}
         env.OIL_KV.get(ALERT_PENDING_KEY, 'json').catch(() => null),
         env.OIL_KV.get('cn_oil_data', 'json').catch(() => null),
       ]);
+      const swNow = await readSwitches(env);
+      const goldSt = await env.OIL_KV.get(GOLD_ALERT_STATE_KEY, 'json').catch(() => null);
       return new Response(JSON.stringify({
         province: '福建',
+        switches: swNow,
+        goldAlert: goldSt ? {
+          day: goldSt.day || null, dayCount: goldSt.dayCount || 0,
+          lastMailedAt: goldSt.lastMailedAt || null,
+          lastStatus: goldSt.lastStatus || null,
+        } : null,
         current: pickFujian(cn && cn.list ? cn.list : null),
         fingerprint: st && st.fp ? st.fp : null,
         lastHeartbeat: st && st.lastHeartbeat ? st.lastHeartbeat : null,
@@ -2268,6 +2320,13 @@ async function fetchGoldAndSave(env, { manual = false, bootstrap = false } = {})
     changed: cached ? cached.priceUsdPerOz !== got.usdPerOz : null,
   };
 
+  // ★ B29：黄金价格变动邮件提醒（开关默认关）。整段兜住，异常绝不影响抓取与 KV 写入。
+  try {
+    await maybeAlertGold(env, cached, gold);
+  } catch (e) {
+    console.log('[gold-alert] 提醒链路异常（已忽略）:', e && e.message ? e.message : String(e));
+  }
+
   // 顺手累积当日开高低收：休市不记，收盘那一次自动定格并写入 gold_history
   try {
     await recordGoldOhlc(env, gold);
@@ -2318,6 +2377,136 @@ async function fetchGoldAndSave(env, { manual = false, bootstrap = false } = {})
  * 边界：国内成品油约 10 个工作日一调、当日 24 时生效，源站按国家公布价每日同步，
  *       最快就是调价次日 08:05 那一拍发现，不是分钟级盯盘。
  */
+// ================= ★ B29：通知开关与黄金价格变动提醒 =================
+/*
+ * 两个开关都存在 KV `alert_switches`，点一个 URL 即开/关：
+ *   · 不进环境变量、不进源码、不需要重新部署 → 不会像「明文变量」那样被 wrangler 对齐清掉
+ *   · fujian 默认 ON（保持 B28 已上线行为不变，用户随时可关）
+ *   · gold   默认 OFF（安全阀：现货黄金每 3 分钟一拍几乎必变，忘了关会刷屏）
+ *
+ * 黄金为什么不能「照搬油价规则」：
+ *   国内油价是发改委 10 个工作日一调的离散事件，一个月最多两封；
+ *   XAU/USD 是连续行情，3 分钟一拍几乎每拍都动，照搬 = 一天最多 480 封，
+ *   会吃爆 Resend 额度、把 QQ 邮箱塞满。所以多了三层保护：
+ *     ① 开关默认关；打开时清空冷却，保证下一拍（≤3 分钟）必发第一封用于验收
+ *     ② 冷却 30 分钟内最多 1 封
+ *     ③ 每日最多 5 封，到顶自动静默（提示去关开关）
+ *   发信仍复用 B28 的 sendResend / 三条 Secret /「旧 → 新 + 涨跌」正文格式。
+ */
+const ALERT_SWITCH_KEY    = 'alert_switches';
+const ALERT_SWITCH_DEFAULT = { fujian: true, gold: false };
+const GOLD_ALERT_STATE_KEY = 'gold_alert_state';
+const GOLD_ALERT_MIN_DELTA = 0.01;                 // 美元/盎司
+const GOLD_ALERT_COOLDOWN_MS = 30 * 60 * 1000;     // 30 分钟最多 1 封
+const GOLD_ALERT_DAILY_CAP   = 5;                  // 每天最多 5 封
+
+/** 读开关；KV 里没记录就回落默认值，坏数据也回落，绝不抛异常 */
+async function readSwitches(env) {
+  const s = await env.OIL_KV.get(ALERT_SWITCH_KEY, 'json').catch(() => null);
+  return {
+    fujian: (s && typeof s.fujian === 'boolean') ? s.fujian : ALERT_SWITCH_DEFAULT.fujian,
+    gold:   (s && typeof s.gold === 'boolean')   ? s.gold   : ALERT_SWITCH_DEFAULT.gold,
+  };
+}
+
+async function writeSwitches(env, sw, at) {
+  await env.OIL_KV.put(ALERT_SWITCH_KEY, JSON.stringify({
+    fujian: !!sw.fujian,
+    gold:   !!sw.gold,
+    updatedAt: at || beijingNow(),
+  }), { expirationTtl: 86400 * 365 }).catch(() => {});
+}
+
+/** 黄金状态单独存一份，与油价的 cn_oil_alert_state 完全隔离，互不干扰 */
+async function saveGoldState(env, st) {
+  await env.OIL_KV.put(GOLD_ALERT_STATE_KEY, JSON.stringify(st),
+    { expirationTtl: 86400 * 7 }).catch(() => {});
+}
+
+/**
+ * 黄金邮件：与福建油价同款「旧 → 新 + 涨跌箭头」，箭头右边就是变动后的价格。
+ * 不标【模拟】：这是真实行情价，只是由开关控制要不要推。
+ */
+function buildGoldMail(prevUsd, nextUsd, delta, gold, prevCny) {
+  const pct = prevUsd ? (delta / prevUsd * 100) : 0;
+  const arrow = delta > 0 ? '↑' : '↓';
+  const lines = [
+    '国际现货黄金（XAU/USD）价格发生变动',
+    '',
+    `美元/盎司：${prevUsd.toFixed(2)} → ${nextUsd.toFixed(2)}（${arrow}${Math.abs(delta).toFixed(2)}）`,
+  ];
+  const nowCny = Number(gold && gold.priceCnyPerGram);
+  const oldCny = Number(prevCny);
+  if (Number.isFinite(nowCny) && Number.isFinite(oldCny) && nowCny > 0 && oldCny > 0) {
+    const d2 = nowCny - oldCny;
+    lines.push(`人民币/克：${oldCny.toFixed(2)} → ${nowCny.toFixed(2)}（${d2 > 0 ? '↑' : '↓'}${Math.abs(d2).toFixed(2)}）`);
+  }
+  lines.push(
+    '',
+    `变动幅度：${delta > 0 ? '+' : ''}${delta.toFixed(2)} 美元/盎司（${pct > 0 ? '+' : ''}${pct.toFixed(2)}%）`,
+    `数据源：${(gold && gold.fetchedFrom) || '—'}`,
+    `发现时间：${beijingNow()}（北京时间）`,
+    '',
+    '说明：本邮件仅在【黄金开关打开】且价格变动 ≥ 0.01 美元/盎司时发送；',
+    '      冷却 30 分钟、每日最多 5 封，防止连续行情刷屏。',
+    '      验收完请打开 /alert-switch?type=gold&on=0&key=<ACCESS_KEY> 关闭。',
+  );
+  return {
+    subject: `【黄金价格变动】${beijingDateString()} XAU/USD 有变动`,
+    text: lines.join('\n'),
+  };
+}
+
+/**
+ * 每拍成功抓到黄金后调用一次。整段由 fetchGoldAndSave 的 try/catch 兜住。
+ * 与油价共用 sendResend，但状态、冷却、日上限独立，不碰 cn_oil_alert_* 任何键。
+ */
+async function maybeAlertGold(env, cached, gold) {
+  const sw = await readSwitches(env);
+  if (!sw.gold) return { skipped: '黄金开关已关闭，静默' };
+
+  const prev = Number(cached && cached.priceUsdPerOz);
+  const next = Number(gold && gold.priceUsdPerOz);
+  if (!Number.isFinite(prev) || !Number.isFinite(next) || prev <= 0 || next <= 0) {
+    return { skipped: '首次建立黄金基线，静默' };
+  }
+
+  const delta = next - prev;
+  const st = (await env.OIL_KV.get(GOLD_ALERT_STATE_KEY, 'json').catch(() => null)) || {};
+  const day = beijingDateString();
+  const dayCount = st.day === day ? (st.dayCount || 0) : 0;
+  const nowMs = Date.now();
+
+  let status = '';
+  if (Math.abs(delta) < GOLD_ALERT_MIN_DELTA) {
+    status = '黄金价格未变（或变动 < 0.01），静默';
+  } else if (st.lastMailedMs && nowMs - st.lastMailedMs < GOLD_ALERT_COOLDOWN_MS) {
+    status = '冷却期内（30 分钟），静默';
+  } else if (dayCount >= GOLD_ALERT_DAILY_CAP) {
+    status = '已达每日上限 5 封，静默（请关闭黄金开关）';
+  }
+  if (status) {
+    const s = { ...st, day, dayCount, lastStatus: status, lastPriceUsdPerOz: next };
+    await saveGoldState(env, s);
+    return s;
+  }
+
+  const mail = buildGoldMail(prev, next, delta, gold, cached && cached.priceCnyPerGram);
+  const r = await sendResend(env, mail.subject, mail.text)
+    .catch(e => ({ ok: false, error: e.message }));
+  const s = {
+    day,
+    dayCount: r.ok ? dayCount + 1 : dayCount,
+    lastMailedMs: r.ok ? nowMs : (st.lastMailedMs || null),
+    lastMailedAt: r.ok ? beijingNow() : (st.lastMailedAt || null),
+    lastPriceUsdPerOz: next,
+    lastStatus: r.ok ? `已发送（id=${r.id}）` : `发信失败：${r.error}（3 分钟后下一拍自动重试）`,
+  };
+  await saveGoldState(env, s);
+  return s;
+}
+// ================= ★ B29 模块结束 =================
+
 const ALERT_STATE_KEY   = 'cn_oil_alert_state';
 const ALERT_PENDING_KEY = 'cn_oil_alert_pending';
 const ALERT_RESEND_URL  = 'https://api.resend.com/emails';
@@ -2417,6 +2606,17 @@ async function buildFujianMail(prev, next, source) {
  * @param newList    本次抓到的 list（新值）
  */
 async function maybeAlertFujian(env, cachedList, newList, source) {
+  // ★ B29：福建开关。关闭时完全静默，但仍写心跳，便于区分「开关关了」与「cron 挂了」
+  const sw = await readSwitches(env);
+  if (!sw.fujian) {
+    const st0 = await env.OIL_KV.get(ALERT_STATE_KEY, 'json').catch(() => null);
+    await env.OIL_KV.put(ALERT_STATE_KEY, JSON.stringify({
+      ...(st0 || {}),
+      lastHeartbeat: beijingNow(),
+      lastStatus: '福建油价开关已关闭，静默',
+    }), { expirationTtl: 86400 * 60 }).catch(() => {});
+    return { skipped: '福建油价开关已关闭，静默' };
+  }
   const nowIso = new Date().toISOString();
   let state = await env.OIL_KV.get(ALERT_STATE_KEY, 'json').catch(() => null);
   let pendingNote = '';

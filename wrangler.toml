@@ -187,6 +187,12 @@ crons = [
 #      若部署后 /oil-alert-test 显示某条 configPresent=false，回面板把它
 #      从「变量」改成「密钥」重新添加一次即可，无需改源码。
 #
+#   ★ B29 两个通知开关存在 KV，不进本文件、不进面板变量：
+#       打开黄金 /alert-switch?type=gold&on=1&key=<ACCESS_KEY>
+#       关闭黄金 /alert-switch?type=gold&on=0&key=<ACCESS_KEY>
+#       福建油价同理用 type=fujian；黄金默认关、福建默认开。
+#       点 URL 即切，不重新部署，三条 Secret 不会被动到。
+#
 #   自检：/oil-alert-test?key=<ACCESS_KEY>    → 发一封测试邮件
 #   状态：/oil-alert-status?key=<ACCESS_KEY> → 指纹 / 心跳 / 上次发信结果
 #
