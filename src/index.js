@@ -1,5 +1,5 @@
 import { SEED_BRENT, SEED_WTI } from './seed.js';
-import { renderAlertCard } from './alertPanel.js';   /* ★ B31：通知开关直接嵌进首页，不再有独立面板页 */
+import { renderAlertCard } from './alertCard.js';    /* ★ B32：开关由服务端直接渲染进首页，独立面板页已删除 */
 import { fetchTick, fetchTickFallback, mergeTickFallback, TICK_SOURCES, renderOilReportPage } from './oilReport.js';   /* ★ B13 原油秒级专页 / ★ B24 补齐多源 / ★ B25 逐品种 */
 import { recordSample, sessionSnapshot, aggregateFromMinutes, pruneMinutes, runRetention, dbStats, KEEP_TICK_DAYS, traceDay, CODES } from './session.js'; /* ★ B18 自建开收盘判定 / ★ B23 黄金纳入 + 判定依据回溯 */
 
@@ -13,7 +13,8 @@ const HF_CLOSED_SEC = 1200;   // 与 oilReport.js 的 CLOSED_AGE_SEC 一致；�
 
 /**
  * oil-data-worker  v8
- * ★ B31：通知开关直接嵌进首页（不再有独立面板页/第二个地址）；
+ * ★ B32：开关卡片服务端直接渲染进首页（打开即显示「已开/已关」且立刻可点，
+ *        不再依赖前端异步请求，彻底根治「读取中…」卡死）；旧独立面板页整个删除；
  *        收件/发件内置默认值，面板明文变量被清掉也不影响发信。
  * ---------------------------------------------------------------
  * v2 改动（针对「手动刷新拉不到新数据」问题）：
@@ -766,6 +767,22 @@ export default {
 
       const cnJson = JSON.stringify((cn && cn.list) || []);
 
+      // ★ B32：开关卡片【服务端直接算好再写进 HTML】。
+      // 页面一打开就是「已开 / 已关」、按钮可点；前端不再需要先 fetch 才能用。
+      const [cardSw, cardCfg, cardOilSt, cardGoldSt] = await Promise.all([
+        readSwitches(env),
+        getMailConfig(env),
+        env.OIL_KV.get(ALERT_STATE_KEY, 'json').catch(() => null),
+        env.OIL_KV.get(GOLD_ALERT_STATE_KEY, 'json').catch(() => null),
+      ]);
+      const cardHtml = renderAlertCard({
+        switches: cardSw,
+        config: configPresentOf(cardCfg),
+        fujian: pickFujian(cn && cn.list ? cn.list : null),
+        gold: cardGoldSt ? { lastMailedAt: cardGoldSt.lastMailedAt, lastStatus: cardGoldSt.lastStatus } : null,
+        oil: cardOilSt ? { lastStatus: cardOilSt.lastStatus, lastHeartbeat: cardOilSt.lastHeartbeat } : null,
+      });
+
       const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -777,7 +794,7 @@ export default {
 <body style="font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 20px">
 <h1>📊 国际原油 & 黄金 · 数据看板</h1>
 
-${renderAlertCard()}
+${cardHtml}
 
 ${o ? `
 <h2 style="margin-top:32px">🛢️ 布伦特原油</h2>
@@ -1341,14 +1358,6 @@ ${histDetail}
 `;
 
       return new Response(txt, { headers: TEXT_HEADERS });
-    }
-
-    // ---------------- /alert-panel（B31：旧地址直接回首页，杜绝第二个收藏地址） ----------------
-    if (url.pathname === '/alert-panel') {
-      return new Response(null, {
-        status: 302,
-        headers: { Location: '/' + (url.search || ''), ...HTML_HEADERS },
-      });
     }
 
     // ---------------- /alert-config（B30：发信配置存 KV，不再依赖面板变量） ----------------
