@@ -1,5 +1,5 @@
 import { SEED_BRENT, SEED_WTI } from './seed.js';
-import { renderAlertPanel } from './alertPanel.js';   /* ★ B30：可视化通知开关面板 */
+import { renderAlertCard } from './alertPanel.js';   /* ★ B31：通知开关直接嵌进首页，不再有独立面板页 */
 import { fetchTick, fetchTickFallback, mergeTickFallback, TICK_SOURCES, renderOilReportPage } from './oilReport.js';   /* ★ B13 原油秒级专页 / ★ B24 补齐多源 / ★ B25 逐品种 */
 import { recordSample, sessionSnapshot, aggregateFromMinutes, pruneMinutes, runRetention, dbStats, KEEP_TICK_DAYS, traceDay, CODES } from './session.js'; /* ★ B18 自建开收盘判定 / ★ B23 黄金纳入 + 判定依据回溯 */
 
@@ -13,6 +13,8 @@ const HF_CLOSED_SEC = 1200;   // 与 oilReport.js 的 CLOSED_AGE_SEC 一致；�
 
 /**
  * oil-data-worker  v8
+ * ★ B31：通知开关直接嵌进首页（不再有独立面板页/第二个地址）；
+ *        收件/发件内置默认值，面板明文变量被清掉也不影响发信。
  * ---------------------------------------------------------------
  * v2 改动（针对「手动刷新拉不到新数据」问题）：
  *  1. 原油：抓取时一并记录 stale（沿用值标记）与 as_of（源观测时间），
@@ -775,6 +777,8 @@ export default {
 <body style="font-family:system-ui,sans-serif;max-width:640px;margin:40px auto;padding:0 20px">
 <h1>📊 国际原油 & 黄金 · 数据看板</h1>
 
+${renderAlertCard()}
+
 ${o ? `
 <h2 style="margin-top:32px">🛢️ 布伦特原油</h2>
 <p><strong>${oilTag}</strong></p>
@@ -1339,9 +1343,12 @@ ${histDetail}
       return new Response(txt, { headers: TEXT_HEADERS });
     }
 
-    // ---------------- /alert-panel（B30：页面上的两个开关，不用再手拼 URL） ----------------
+    // ---------------- /alert-panel（B31：旧地址直接回首页，杜绝第二个收藏地址） ----------------
     if (url.pathname === '/alert-panel') {
-      return new Response(renderAlertPanel(), { headers: HTML_HEADERS });
+      return new Response(null, {
+        status: 302,
+        headers: { Location: '/' + (url.search || ''), ...HTML_HEADERS },
+      });
     }
 
     // ---------------- /alert-config（B30：发信配置存 KV，不再依赖面板变量） ----------------
@@ -1377,7 +1384,7 @@ ${histDetail}
         configPresent: configPresentOf(cfg),
         masked: maskConfig(cfg),
         note: kv ? '发信配置存于 KV，重新部署不会被清掉'
-                 : 'KV 为空，暂用面板 Secret；首次发信时会自动镜像进 KV',
+                 : '收件/发件已内置默认值，面板明文变量被清掉也不影响；仅需保留面板 Secret：RESEND_API_KEY',
         at: beijingNow(),
       }, null, 2), { headers: JSON_HEADERS });
     }
@@ -1420,13 +1427,9 @@ ${histDetail}
           day: gst.day || null, dayCount: gst.dayCount || 0,
           lastMailedAt: gst.lastMailedAt || null, lastStatus: gst.lastStatus || null,
         } : null,
-        panel: '/alert-panel?key=<ACCESS_KEY>',
+        panel: '本页（数据看板首页）顶部的「邮件通知开关」卡片',
         usage: {
-          '通知面板（推荐）': '/alert-panel?key=<ACCESS_KEY>',
-          '打开黄金': '/alert-switch?type=gold&on=1&key=<ACCESS_KEY>',
-          '关闭黄金': '/alert-switch?type=gold&on=0&key=<ACCESS_KEY>',
-          '打开福建油价': '/alert-switch?type=fujian&on=1&key=<ACCESS_KEY>',
-          '关闭福建油价': '/alert-switch?type=fujian&on=0&key=<ACCESS_KEY>',
+          '开关位置': '首页顶部「邮件通知开关」卡片，点一下即切，不用另存地址、不用记参数',
         },
         at: beijingNow(),
       }, null, 2), { headers: JSON_HEADERS });
@@ -1453,7 +1456,7 @@ ${histDetail}
         configPresent: configPresentOf(cfg),
         configSource: (await env.OIL_KV.get(ALERT_MAIL_CONFIG_KEY, 'json').catch(() => null)) ? 'kv' : 'env',
         hint: r.ok ? '去收件箱查收（QQ 邮箱请顺手看一眼垃圾箱）'
-                   : '检查面板三条变量是否配齐、Resend 发信域是否已 Verified',
+                   : '检查面板 Secret RESEND_API_KEY 是否还在、Resend 发信域 you.599568.xyz 是否 Verified',
         at: beijingNow(),
       }, null, 2), { headers: JSON_HEADERS });
     }
@@ -2446,16 +2449,20 @@ const GOLD_ALERT_MIN_DELTA = 0;                    // 0 = 价格有任何不等�
 
 // ★ B30：发信配置存 KV。以后不管部署多少次、面板变量被不被对齐清掉，都能正常发信。
 const ALERT_MAIL_CONFIG_KEY = 'alert_mail_config';
+// ★ B31：收件/发件内置默认值。面板里那两条明文变量被 wrangler 对齐清掉也不影响发信；
+//   唯一必须保留的是 Secret：RESEND_API_KEY（它一直没掉过，别删）。
+const ALERT_MAIL_TO_DEFAULT   = '366190089@qq.com';
+const ALERT_MAIL_FROM_DEFAULT = 'oil@you.599568.xyz';
 
 /** 发信配置：优先 KV，回落面板 Secret；KV 空且面板有值时自动镜像一次，以后部署不掉 */
 async function getMailConfig(env) {
   const kv = await env.OIL_KV.get(ALERT_MAIL_CONFIG_KEY, 'json').catch(() => null);
   const cfg = {
     key:  (kv && kv.key)  || env.RESEND_API_KEY  || '',
-    to:   (kv && kv.to)   || env.ALERT_MAIL_TO   || '',
-    from: (kv && kv.from) || env.ALERT_MAIL_FROM || '',
+    to:   (kv && kv.to)   || env.ALERT_MAIL_TO   || ALERT_MAIL_TO_DEFAULT,
+    from: (kv && kv.from) || env.ALERT_MAIL_FROM || ALERT_MAIL_FROM_DEFAULT,
   };
-  if ((!kv || !kv.key) && (env.RESEND_API_KEY || env.ALERT_MAIL_TO || env.ALERT_MAIL_FROM)) {
+  if ((!kv || !kv.key) && env.RESEND_API_KEY) {
     await env.OIL_KV.put(ALERT_MAIL_CONFIG_KEY, JSON.stringify({
       key: cfg.key, to: cfg.to, from: cfg.from, migratedAt: beijingNow(),
     }), { expirationTtl: 86400 * 365 }).catch(() => {});
@@ -2529,7 +2536,7 @@ function buildGoldMail(prevUsd, nextUsd, delta, gold, prevCny) {
     '',
     '说明：本邮件仅在【黄金开关打开】且价格有变动时发送；',
     '      开关打开期间每 3 分钟检测一次，有变动即发一封。',
-    '      在通知面板把「现货黄金」关掉，即立刻停止发送。',
+    '      在本页顶部「邮件通知开关」把「现货黄金」关掉，即立刻停止发送。',
   );
   return {
     subject: `【黄金价格变动】${beijingDateString()} XAU/USD 有变动`,
