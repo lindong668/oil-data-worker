@@ -176,25 +176,23 @@ crons = [
 #      （B7 起黄金不再需要 API Key：主源 xaus.com，备用 api.gold-api.com，均免 key）
 #      SHOWAPI_APPKEY      万维易源 138-46 AppKey
 #
-#   ★ B28 新增三条（福建油价变动邮件提醒，全部只在面板设置，不写进本文件）：
-#      RESEND_API_KEY      Resend 发信 API Key
-#      ALERT_MAIL_TO       收件邮箱
-#      ALERT_MAIL_FROM     发件地址，必须是 Resend 已 Verified 的域
-#                          例如 oil@you.599568.xyz
+#   ★ B30：发信配置改为【优先读 KV】，不再依赖面板变量。
+#      KV 键 alert_mail_config 存 { key, to, from }，在通知面板里直接填写保存：
+#        /alert-panel?key=<ACCESS_KEY>  → 展开「发信设置」→ 填三条 → 保存
+#      面板 Secret（RESEND_API_KEY / ALERT_MAIL_TO / ALERT_MAIL_FROM）仍可作为回落：
+#      KV 为空而面板有值时，首次发信会自动把面板值镜像进 KV，之后部署清空也不影响。
+#      ⚠️ 三条绝不写进下面的 [vars]（明文变量会被 wrangler 按 toml 对齐清掉）。
 #
-#   ⚠️ 这三条请一律设为「密钥 / Secret」，不要加进下面的 [vars]。
-#      Git 连接部署时 [vars] 里的同名键会覆盖面板值；Secret 不进 toml，部署后仍在。
-#      若部署后 /oil-alert-test 显示某条 configPresent=false，回面板把它
-#      从「变量」改成「密钥」重新添加一次即可，无需改源码。
-#
-#   ★ B29 两个通知开关存在 KV，不进本文件、不进面板变量：
-#       打开黄金 /alert-switch?type=gold&on=1&key=<ACCESS_KEY>
-#       关闭黄金 /alert-switch?type=gold&on=0&key=<ACCESS_KEY>
-#       福建油价同理用 type=fujian；黄金默认关、福建默认开。
-#       点 URL 即切，不重新部署，三条 Secret 不会被动到。
+#   ★ B30：两个通知开关做成了页面，不用再手拼 URL：
+#        /alert-panel?key=<ACCESS_KEY>   可视化开关（收藏这个地址即可）
+#        · 福建油价：默认开，有变动才发，没调价静默
+#        · 现货黄金：默认关；打开后每 3 分钟有变动就发一封，关掉立即停
+#      底层端点 /alert-switch 保留，兼容性不变；开关状态存 KV alert_switches。
+#      关闭黄金时后端会连 gold_alert_state 一起清掉，双保险。
 #
 #   自检：/oil-alert-test?key=<ACCESS_KEY>    → 发一封测试邮件
 #   状态：/oil-alert-status?key=<ACCESS_KEY> → 指纹 / 心跳 / 上次发信结果
+#   配置：/alert-config?key=<ACCESS_KEY>     → 只读掩码 / POST 保存
 #
 #    本地开发用 .dev.vars（记得加进 .gitignore）：
 #      OILPRICEAPI_KEY="xxxx"
