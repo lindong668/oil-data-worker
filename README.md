@@ -301,3 +301,35 @@ Node 对整文件 `node --check` 恰好返回 0（中文字符可作标识符，
 ```
 
 含义完全相同，且不依赖 `*/` 步长语法。
+
+
+---
+
+## B28 · 福建省油价变动邮件提醒（2026-11-18）
+
+以线上仓 `oil-data-worker` 的 B27 为唯一基线，只改 `src/index.js` 一处逻辑 +
+`wrangler.toml` 注释。**cron、KV 绑定、D1、路由、抓取链路、报表页全部未动。**
+
+### 行为
+
+- 每天北京 08:05 / 08:20 两拍抓全国 31 省油价；写 KV 前比对**福建省** 92/95/98/0 号柴油
+- 任一标号价格变动 → 发一封邮件（含新旧价与涨跌箭头）；**没变静默、搁浅不推、外省不列**
+- `cn_oil_alert_state` 存四标号指纹 + 心跳，两拍/手动刷新都不会重复发同一条调价
+- 发信失败写 `cn_oil_alert_pending`，下一拍先补发（最多 3 次）
+- 首次部署只建立基线，不发「初始化」邮件
+
+### 面板需有 3 条 Secret（值不进源码、不进仓库）
+
+| 名称 | 值 |
+|---|---|
+| `RESEND_API_KEY` | Resend API Key |
+| `ALERT_MAIL_TO` | 收件邮箱 |
+| `ALERT_MAIL_FROM` | 已验证域的发件地址，如 `oil@you.599568.xyz` |
+
+### 部署后自检
+
+`https://<你的worker域>/oil-alert-test?key=<ACCESS_KEY>` → 返回 `ok:true` 并收到测试邮件
+`https://<你的worker域>/oil-alert-status?key=<ACCESS_KEY>` → 看 `fingerprint` / `lastHeartbeat` / `lastStatus`
+
+> 边界：国内成品油约 10 个工作日一调、当日 24 时生效、源站次日同步，
+> 最快为调价次日 08:05 那一拍发现，不是分钟级盯盘。

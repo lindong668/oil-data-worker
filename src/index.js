@@ -1338,6 +1338,59 @@ ${histDetail}
       return new Response(txt, { headers: TEXT_HEADERS });
     }
 
+    // ---------------- /oil-alert-test（B28：邮件通道自检，发一封测试邮件） ----------------
+    if (url.pathname === '/oil-alert-test') {
+      if (!ok) return ghost();
+      const text = [
+        '【测试邮件】3 号原油后端 · 福建油价变动提醒',
+        '',
+        '这是一封通道自检邮件，不代表真实调价。',
+        `发送时间：${beijingNow()}（北京时间）`,
+        '',
+        '真实提醒规则：仅福建省 92 / 95 / 98 / 0 号柴油任一价格变动才发；',
+        '价格未调整（含搁浅）、外省变动均不发送。',
+      ].join('\n');
+      const r = await sendResend(env, '【测试】福建油价提醒通道自检', text)
+        .catch(e => ({ ok: false, error: e.message }));
+      return new Response(JSON.stringify({
+        ok: r.ok,
+        result: r,
+        configPresent: {
+          RESEND_API_KEY:  !!env.RESEND_API_KEY,
+          ALERT_MAIL_TO:   !!env.ALERT_MAIL_TO,
+          ALERT_MAIL_FROM: !!env.ALERT_MAIL_FROM,
+        },
+        hint: r.ok ? '去收件箱查收（QQ 邮箱请顺手看一眼垃圾箱）'
+                   : '检查面板三条变量是否配齐、Resend 发信域是否已 Verified',
+        at: beijingNow(),
+      }, null, 2), { headers: JSON_HEADERS });
+    }
+
+    // ---------------- /oil-alert-status（B28：指纹 / 心跳 / 待补发，只读） ----------------
+    if (url.pathname === '/oil-alert-status') {
+      if (!ok) return ghost();
+      const [st, pend, cn] = await Promise.all([
+        env.OIL_KV.get(ALERT_STATE_KEY, 'json').catch(() => null),
+        env.OIL_KV.get(ALERT_PENDING_KEY, 'json').catch(() => null),
+        env.OIL_KV.get('cn_oil_data', 'json').catch(() => null),
+      ]);
+      return new Response(JSON.stringify({
+        province: '福建',
+        current: pickFujian(cn && cn.list ? cn.list : null),
+        fingerprint: st && st.fp ? st.fp : null,
+        lastHeartbeat: st && st.lastHeartbeat ? st.lastHeartbeat : null,
+        lastStatus: st && st.lastStatus ? st.lastStatus : null,
+        lastMailedAt: st && st.lastMailedAt ? st.lastMailedAt : null,
+        pending: pend ? { attempts: pend.attempts, createdAt: pend.createdAt, lastError: pend.lastError } : null,
+        configPresent: {
+          RESEND_API_KEY:  !!env.RESEND_API_KEY,
+          ALERT_MAIL_TO:   !!env.ALERT_MAIL_TO,
+          ALERT_MAIL_FROM: !!env.ALERT_MAIL_FROM,
+        },
+        note: 'Cron 静默失败时 lastHeartbeat 会停在旧时间，据此可区分「没调价」与「任务挂了」',
+      }, null, 2), { headers: JSON_HEADERS });
+    }
+
     return new Response('Not Found', { status: 404 });
   },
 
@@ -2247,6 +2300,196 @@ async function fetchGoldAndSave(env, { manual = false, bootstrap = false } = {})
 }
 
 
+// ================= 福建省油价变动 · 邮件提醒（B28） =================
+/*
+ * 目标：只在【福建省】92 / 95 / 98 / 0 号柴油任一标号价格发生变动时发一封邮件。
+ *       价格没变 → 静默；外省变动 → 不管；搁浅（不调价）→ 自然不发。
+ *
+ * 通道：Resend REST（POST https://api.resend.com/emails）。
+ *       RESEND_API_KEY / ALERT_MAIL_TO / ALERT_MAIL_FROM 全部只从 env 读，不进源码。
+ *
+ * 去重：KV `cn_oil_alert_state` 存「福建四标号指纹 + 心跳 + 上次发信结果」。
+ *       08:05 / 08:20 两拍、手动 /update 都不会重复发同一条调价。
+ * 兜底：发信失败写 `cn_oil_alert_pending`，下一拍先补发（最多 3 次）；
+ *       整条提醒链路抛异常也绝不影响主抓取与 KV 写入。
+ * 心跳：CF Cron 抛异常是静默的，`lastHeartbeat` 停更即说明任务挂了，
+ *       可用 /oil-alert-status 一眼分清「没调价」还是「任务没跑」。
+ *
+ * 边界：国内成品油约 10 个工作日一调、当日 24 时生效，源站按国家公布价每日同步，
+ *       最快就是调价次日 08:05 那一拍发现，不是分钟级盯盘。
+ */
+const ALERT_STATE_KEY   = 'cn_oil_alert_state';
+const ALERT_PENDING_KEY = 'cn_oil_alert_pending';
+const ALERT_RESEND_URL  = 'https://api.resend.com/emails';
+const ALERT_LABELS = [
+  ['p92', '92号汽油'],
+  ['p95', '95号汽油'],
+  ['p98', '98号汽油'],
+  ['p0',  '0号柴油'],
+];
+
+/** 价格归一化：'—' / 空 / 带单位一律转 null，避免把缺失当变动 */
+function normPrice(v) {
+  if (v === null || v === undefined) return null;
+  const t = String(v).replace(/[,，\s元\/升]/g, '');
+  if (!t || t === '-' || t === '--') return null;
+  const n = parseFloat(t);
+  return Number.isFinite(n) ? n : null;
+}
+
+function pickFujian(list) {
+  if (!Array.isArray(list)) return null;
+  return list.find(r => r && String(r.province || '').replace(/省$/, '') === '福建') || null;
+}
+
+/** 指纹只含四个价格，故意不含 ct（刷新批次）与 source，
+ *  否则「价格没变、批次换了」也会误发一封，违背「有变动才发」。 */
+function alertFingerprint(row) {
+  return ALERT_LABELS.map(([k]) => {
+    const n = normPrice(row ? row[k] : null);
+    return n === null ? 'x' : n.toFixed(4);
+  }).join('|');
+}
+
+/** 只有新旧两边都读到有效数值且不相等，才算「变动」 */
+function diffFujian(prev, next) {
+  const lines = [];
+  let changed = false;
+  for (const [k, label] of ALERT_LABELS) {
+    const a = normPrice(prev ? prev[k] : null);
+    const b = normPrice(next ? next[k] : null);
+    if (a !== null && b !== null && Math.abs(a - b) > 0.0001) {
+      changed = true;
+      const d = b - a;
+      lines.push(`${label}：${a.toFixed(2)} → ${b.toFixed(2)} 元/升（${d > 0 ? '↑' : '↓'}${Math.abs(d).toFixed(2)}）`);
+    } else {
+      lines.push(`${label}：${a === null ? '—' : a.toFixed(2)} → ${b === null ? '—' : b.toFixed(2)} 元/升（未变）`);
+    }
+  }
+  return { changed, lines };
+}
+
+async function sendResend(env, subject, text) {
+  const key  = env.RESEND_API_KEY;
+  const to   = env.ALERT_MAIL_TO;
+  const from = env.ALERT_MAIL_FROM;
+  if (!key || !to || !from) {
+    return { ok: false, configMissing: true,
+             error: 'RESEND_API_KEY / ALERT_MAIL_TO / ALERT_MAIL_FROM 未配齐' };
+  }
+  const res = await fetch(ALERT_RESEND_URL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${key}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ from, to: [to], subject, text }),
+  });
+  const body = await res.text().catch(() => '');
+  if (!res.ok) return { ok: false, error: `Resend ${res.status}: ${body.slice(0, 300)}` };
+  let id = '';
+  try { id = JSON.parse(body).id || ''; } catch (_) {}
+  return { ok: true, id };
+}
+
+async function buildFujianMail(prev, next, source) {
+  const d = diffFujian(prev, next);
+  if (!d.changed) return null;
+  const subject = `【福建油价调价】${beijingDateString()} 价格有变动`;
+  const text = [
+    '福建省成品油零售限价发生变动',
+    '',
+    ...d.lines,
+    '',
+    `调价批次：${next.ct || '—'}`,
+    `数据来源：${source === 'showapi' ? '万维易源 ShowAPI 138-46' : 'ApiZero 逐省兜底'}`,
+    `发现时间：${beijingNow()}（北京时间）`,
+    '',
+    '说明：本邮件仅在福建省 92 / 95 / 98 / 0 号柴油任一价格变动时发送；',
+    '      价格未调整（含搁浅）、外省变动均不发送。',
+  ].join('\n');
+  return { subject, text };
+}
+
+/**
+ * 每次成功抓到国内油价后调用一次。
+ * @param cachedList 上一次 KV 里的 list（旧值）
+ * @param newList    本次抓到的 list（新值）
+ */
+async function maybeAlertFujian(env, cachedList, newList, source) {
+  const nowIso = new Date().toISOString();
+  let state = await env.OIL_KV.get(ALERT_STATE_KEY, 'json').catch(() => null);
+  let pendingNote = '';
+
+  // ① 上一拍发信失败 → 先补发，成功即清 pending；失败累计 3 次后放弃，避免无限重试
+  const pending = await env.OIL_KV.get(ALERT_PENDING_KEY, 'json').catch(() => null);
+  if (pending && pending.subject && pending.text) {
+    const r = await sendResend(env, pending.subject, pending.text)
+      .catch(e => ({ ok: false, error: e.message }));
+    if (r.ok) {
+      await env.OIL_KV.delete(ALERT_PENDING_KEY).catch(() => {});
+      state = { ...(state || {}), lastMailedAt: nowIso };
+      pendingNote = 'pending 补发成功';
+    } else {
+      const attempts = (pending.attempts || 1) + 1;
+      if (attempts >= 4) {
+        await env.OIL_KV.delete(ALERT_PENDING_KEY).catch(() => {});
+        pendingNote = `pending 补发放弃（${attempts} 次）：${r.error}`;
+      } else {
+        await env.OIL_KV.put(ALERT_PENDING_KEY,
+          JSON.stringify({ ...pending, attempts, lastError: r.error }),
+          { expirationTtl: 86400 * 7 }).catch(() => {});
+      }
+    }
+  }
+
+  // ② 福建省新旧比对
+  const prev = pickFujian(cachedList);
+  const next = pickFujian(newList);
+  const fp      = next ? alertFingerprint(next) : null;
+  const prevFp  = state && state.fp ? state.fp : null;
+  let mailed = false;
+  let note = '';
+
+  if (next && prev && fp && fp !== prevFp) {
+    const mail = await buildFujianMail(prev, next, source);
+    if (mail) {
+      const r = await sendResend(env, mail.subject, mail.text)
+        .catch(e => ({ ok: false, error: e.message }));
+      if (r.ok) {
+        mailed = true;
+        note = `已发送（id=${r.id}）`;
+      } else {
+        await env.OIL_KV.put(ALERT_PENDING_KEY, JSON.stringify({
+          subject: mail.subject, text: mail.text, attempts: 1,
+          createdAt: nowIso, lastError: r.error,
+        }), { expirationTtl: 86400 * 7 }).catch(() => {});
+        note = `发信失败，已挂起待下一拍补发：${r.error}`;
+      }
+    } else {
+      note = '福建指纹变化但四标号无有效数值变动，静默';
+    }
+  } else if (!prev) {
+    note = '首次建立福建基线，静默（不发初始化邮件）';
+  } else {
+    note = '福建价格未变，静默';
+  }
+
+  // ③ 无论发没发都更新指纹 + 心跳（一次 KV 写，去重与心跳合一）
+  const newState = {
+    fp: fp || prevFp || null,
+    at: nowIso,
+    lastHeartbeat: beijingNow(),
+    lastCheckFp: fp,
+    lastMailed: mailed,
+    lastMailedAt: mailed ? nowIso : (state && state.lastMailedAt ? state.lastMailedAt : null),
+    lastStatus: pendingNote ? (pendingNote + '；' + note) : note,
+  };
+  await env.OIL_KV.put(ALERT_STATE_KEY, JSON.stringify(newState),
+    { expirationTtl: 86400 * 60 }).catch(() => {});
+  return newState;
+}
+
 // ================= 国内成品油 =================
 const SHOWAPI_URL = 'https://route.showapi.com/138-46';
 const APIZERO_URL = 'https://v1.apizero.cn/api/oil-price';
@@ -2321,6 +2564,12 @@ async function fetchCnOilAll(env, { manual = false } = {}) {
     updatedAt: new Date().toISOString(),
     note: '各省最高零售限价，约每10个工作日调整一次',
   };
+  // ★ B28：福建省价格变动邮件提醒。整段兜住，异常绝不影响主抓取与 KV 写入。
+  try {
+    await maybeAlertFujian(env, cached && cached.list ? cached.list : null, list, source);
+  } catch (e) {
+    console.log('[alert] 提醒链路异常（已忽略）:', e && e.message ? e.message : String(e));
+  }
   await env.OIL_KV.put('cn_oil_data', JSON.stringify(result), { expirationTtl: 86400 * 15 });
   await markDailyFetched(env, 'cn_oil_fetch_marker', manual ? 'manual' : 'cron');
   return result;
